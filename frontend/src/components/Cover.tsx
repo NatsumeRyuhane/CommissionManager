@@ -17,10 +17,10 @@ export function Cover({
   size?: ImagePreset; // derivative preset for this surface; originals never load here
   sizes?: string; // when set, expose the derivative srcset and let the browser pick
 }) {
-  // shimmer the placeholder until the derivative actually paints, so a slow
+  // label the placeholder until the derivative actually paints, so a slow
   // network reads as "loading" rather than an empty hatched box
   const [loaded, setLoaded] = useState(false);
-  // re-arm the shimmer whenever the displayed source can change: a new cover or
+  // re-arm the label whenever the displayed source can change: a new cover or
   // a different derivative preset both swap the underlying <img src>
   useEffect(() => setLoaded(false), [cover?.url, size]);
 
@@ -52,7 +52,7 @@ export function Cover({
   }
   const srcSet = sizes ? presetSrcSet(cover.image_urls, cover.width, cover.height) : undefined;
   return (
-    <div className={`imgph${loaded ? "" : " skeleton"}`} style={style}>
+    <div className={`imgph${loaded ? "" : " is-loading"}`} style={style}>
       <DerivedImg
         src={presetUrl(cover.image_urls, size, cover.url)}
         srcSet={srcSet}

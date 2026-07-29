@@ -4,7 +4,6 @@ import { Link } from "react-router-dom";
 import type { CommissionListItem } from "../api/types";
 import { Chip } from "./Chip";
 import { Cover } from "./Cover";
-import { Skeleton } from "./Skeleton";
 
 /** Columns that fit the current viewport, capped at `max`. */
 function useViewportColumns(max: number) {
@@ -32,7 +31,7 @@ const SKELETON_RATIOS = [0.8, 1, 1.3, 0.7, 1.1, 0.9, 1.2, 0.75];
 /** FurAffinity-style column layout: items flow into N height-balanced columns,
  *  preserving left-to-right, top-to-bottom order within the balancing.
  *  `columns` is an upper bound; narrow viewports drop to 3 then 2.
- *  `skeletonCount` appends that many shimmer placeholders after the real items,
+ *  `skeletonCount` appends that many loading placeholders after the real items,
  *  balanced into the same columns (used while the next page is loading). */
 export function FaGallery({
   items,
@@ -123,7 +122,10 @@ export function FaGallery({
           })}
           {col.skeletons.map((ratio, j) => (
             <div className="fa-tile is-skeleton" key={`sk-${j}`} aria-hidden="true">
-              <Skeleton style={{ aspectRatio: String(ratio), borderRadius: 0 }} />
+              <div
+                className="imgph is-loading"
+                style={{ aspectRatio: String(ratio), borderRadius: 0 }}
+              />
             </div>
           ))}
         </div>
