@@ -182,7 +182,6 @@ def _commission_export(commission: Commission) -> dict[str, object]:
         "metadata": {
             "title": meta.title,
             "description": meta.description,
-            "completed_at": meta.completed_at,
             "rating": meta.rating.value,
             "cover_file_id": meta.cover_file_id,
             "confirmed_at": meta.confirmed_at,
@@ -212,6 +211,7 @@ def _node_export(node: CommissionNode) -> dict[str, object]:
             {
                 "id": file.id,
                 "storage_object_id": file.storage_object_id,
+                "position": file.position,
                 "format": file.format,
                 "label": file.label,
                 "is_image": file.is_image,
@@ -219,6 +219,7 @@ def _node_export(node: CommissionNode) -> dict[str, object]:
                 "height": file.height,
                 "focal_x": file.focal_x,
                 "focal_y": file.focal_y,
+                "focal_zoom": file.focal_zoom,
                 "visibility_override": file.visibility_override.value if file.visibility_override else None,
                 "created_at": file.created_at,
             }

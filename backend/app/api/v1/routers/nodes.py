@@ -3,14 +3,21 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.v1 import crud
 from app.auth.deps import Principal, get_principal, require_edit
 from app.db import get_db
-from app.models import Commission, CommissionFile, CommissionNode, Visibility
+from app.models import (
+    Commission,
+    CommissionFile,
+    CommissionNode,
+    UploadSession,
+    Visibility,
+)
 from app.schemas import NodeCreate, NodeOut, NodeReorder, NodeUpdate
+from app.storage import get_storage
 
 router = APIRouter(tags=["nodes"])
 
@@ -135,21 +142,67 @@ def delete_node(
     if node.is_detached:
         raise HTTPException(status_code=400, detail="The detached node cannot be deleted")
 
-    detached = db.scalar(
+    detached_candidate = db.scalar(
         select(CommissionNode).where(
             CommissionNode.commission_id == node.commission_id,
             CommissionNode.is_detached.is_(True),
         )
     )
+    if detached_candidate is None:
+        raise HTTPException(status_code=500, detail="Commission is missing its detached node")
+    locked_nodes = {
+        locked.id: locked
+        for locked in db.scalars(
+            select(CommissionNode)
+            .where(CommissionNode.id.in_([node.id, detached_candidate.id]))
+            .order_by(CommissionNode.id)
+            .with_for_update()
+        )
+    }
+    node = locked_nodes.get(node.id)
+    detached = locked_nodes.get(detached_candidate.id)
+    if node is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Node not found")
     if detached is None:
         raise HTTPException(status_code=500, detail="Commission is missing its detached node")
 
-    # reparent this node's files to the detached node, then drop the node
-    db.execute(
-        update(CommissionFile)
-        .where(CommissionFile.node_id == node.id)
-        .values(node_id=detached.id)
+    # Reparent in the existing order and append after any detached files.
+    detached_positions = [
+        file.position for file in detached.files
+    ]
+    next_position = max(detached_positions, default=-1) + 1
+    files = list(
+        db.scalars(
+            select(CommissionFile)
+            .where(CommissionFile.node_id == node.id)
+            .order_by(CommissionFile.position, CommissionFile.id)
+        )
     )
-    db.expire(node, ["files"])
+    for index, file in enumerate(files):
+        file.position = next_position + index
+        file.node_id = detached.id
+    db.flush()
+
+    # Best-effort cleanup of bytes from pending direct-upload sessions tied to
+    # this node. The FK cascade will drop the session rows along with the node,
+    # but `cleanup_expired_upload_sessions` only sees sessions still in the DB
+    # — without this loop the S3 keys would become permanent orphans. We
+    # swallow per-key errors so a transient S3 outage cannot block the delete.
+    pending_sessions = list(
+        db.scalars(
+            select(UploadSession).where(
+                UploadSession.node_id == node.id,
+                UploadSession.finalized_at.is_(None),
+            )
+        )
+    )
+    if pending_sessions:
+        storage = get_storage()
+        for session in pending_sessions:
+            try:
+                storage.delete(session.storage_key, bucket=session.storage_bucket)
+            except Exception:  # noqa: BLE001 — best-effort, never abort the delete
+                pass
+
     db.delete(node)
     db.commit()

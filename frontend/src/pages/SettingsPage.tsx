@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { Copy, Plus, X } from "lucide-react";
 
 import { api } from "../api/client";
 import type {
@@ -36,7 +37,6 @@ const FIELD_ROWS: { key: VisibilityFieldKey; label: string; note?: string }[] = 
   { key: "rating", label: "Rating" },
   { key: "characters", label: "Characters" },
   { key: "artists", label: "Artists" },
-  { key: "completed_at", label: "Completed date" },
   { key: "confirmed_at", label: "Confirmed at", note: "usually private" },
   { key: "price", label: "Price", note: "usually private" },
 ];
@@ -184,16 +184,47 @@ export function SettingsPage() {
         <main className="settings-content">
           {loading && <div className="mono-sm muted">Loading settings…</div>}
           {error && <div className="error-text">{error}</div>}
-          {!loading && !error && tab === "site" && site && (
+          {!loading && !error && tab === "site" && site && visibility && (
             <SitePanel
-              value={site}
+              site={site}
+              visibility={visibility}
               busy={saving}
               onChange={setSite}
-              onSave={async () => {
+              onSave={async (rows) => {
                 setSaving(true);
                 setError(null);
                 try {
-                  setSite(await api.updateSiteSettings({ site_title: site.site_title }));
+                  const cleaned = rows
+                    .map((row) => ({ ...row, stage_name: row.stage_name.trim() }))
+                    .filter((row) => row.stage_name);
+                  // one editor, two stores: ordered names feed the site stage
+                  // template, the full rows feed the visibility stage defaults
+                  const previousStageNames = site.default_stage_names;
+                  const nextSite = await api.updateSiteSettings({
+                    site_title: site.site_title,
+                    default_stage_names: cleaned.map((row) => row.stage_name),
+                    allow_public_original_download: site.allow_public_original_download,
+                  });
+                  let nextVisibility;
+                  try {
+                    nextVisibility = await api.updateVisibilitySettings({
+                      stage_defaults: cleaned.map((row, index) => ({
+                        stage_name: row.stage_name,
+                        visibility: row.visibility,
+                        position: index,
+                        note: row.note || null,
+                      })),
+                    });
+                  } catch (visibilityError) {
+                    // keep the two stores in step: revert the template before
+                    // surfacing the error (best effort — the revert may fail too)
+                    await api
+                      .updateSiteSettings({ default_stage_names: previousStageNames })
+                      .catch(() => undefined);
+                    throw visibilityError;
+                  }
+                  setSite(nextSite);
+                  setVisibility(nextVisibility);
                 } catch (e) {
                   setError(String(e));
                 } finally {
@@ -238,17 +269,12 @@ export function SettingsPage() {
                 setSaving(true);
                 setError(null);
                 try {
+                  // stage defaults are managed from the Site tab's stage editor
                   const body = {
                     preset: visibility.preset,
                     default_commission_visibility: visibility.default_commission_visibility,
                     default_stage_visibility: visibility.default_stage_visibility,
                     fields: visibility.fields,
-                    stage_defaults: visibility.stage_defaults.map((row, index) => ({
-                      stage_name: row.stage_name,
-                      visibility: row.visibility,
-                      position: index,
-                      note: row.note || null,
-                    })),
                   };
                   setVisibility(await api.updateVisibilitySettings(body));
                 } catch (e) {
@@ -259,7 +285,27 @@ export function SettingsPage() {
               }}
             />
           )}
-          {!loading && !error && tab === "storage" && storage && <StoragePanel storage={storage} />}
+          {!loading && !error && tab === "storage" && storage && site && (
+            <StoragePanel
+              storage={storage}
+              site={site}
+              busy={saving}
+              onToggleDirectUpload={async (next) => {
+                setSaving(true);
+                setError(null);
+                try {
+                  const updated = await api.updateSiteSettings({
+                    allow_direct_upload: next,
+                  });
+                  setSite(updated);
+                } catch (e) {
+                  setError(String(e));
+                } finally {
+                  setSaving(false);
+                }
+              }}
+            />
+          )}
           {tab === "categories" && (
             <TaxonomyManagementPanel
               kind="category"
@@ -289,21 +335,100 @@ export function SettingsPage() {
   );
 }
 
+const STAGE_ROW_DRAG_TYPE = "application/x-cmgr-stage-row";
+
+interface StageRow {
+  /** Client-side identity so list keys survive reorders and removals. */
+  id: string;
+  stage_name: string;
+  visibility: Visibility;
+  note: string;
+}
+
+const newRowId = () =>
+  typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2);
+
+/** The single stage editor drives both stores, so its initial state merges
+ *  them: template names in order (visibility/note from the matching stage
+ *  default), then any leftover stage defaults that weren't in the template. */
+function mergeStageRows(site: SiteSettings, visibility: VisibilitySettings): StageRow[] {
+  const byName = new Map(
+    visibility.stage_defaults.map((row) => [row.stage_name.toLowerCase(), row]),
+  );
+  const rows: StageRow[] = site.default_stage_names.map((name) => {
+    const match = byName.get(name.toLowerCase());
+    if (match) byName.delete(name.toLowerCase());
+    return {
+      id: newRowId(),
+      stage_name: name,
+      visibility: match?.visibility ?? visibility.default_stage_visibility,
+      note: match?.note ?? "",
+    };
+  });
+  for (const row of byName.values()) {
+    rows.push({
+      id: newRowId(),
+      stage_name: row.stage_name,
+      visibility: row.visibility,
+      note: row.note ?? "",
+    });
+  }
+  return rows;
+}
+
 function SitePanel({
-  value,
+  site,
+  visibility,
   busy,
   onChange,
   onSave,
 }: {
-  value: SiteSettings;
+  site: SiteSettings;
+  visibility: VisibilitySettings;
   busy: boolean;
   onChange: (next: SiteSettings) => void;
-  onSave: () => void;
+  onSave: (rows: StageRow[]) => void;
 }) {
-  function submit(e: React.FormEvent) {
-    e.preventDefault();
-    if (!value.site_title.trim()) return;
-    onSave();
+  const [rows, setRows] = useState<StageRow[]>(() => mergeStageRows(site, visibility));
+  const [newStage, setNewStage] = useState("");
+  const [dragIndex, setDragIndex] = useState<number | null>(null);
+  const [dropIndex, setDropIndex] = useState<number | null>(null);
+
+  // re-derive the editor from the canonical server state after a save;
+  // keying on updated_at (not the objects) keeps in-progress edits to other
+  // fields from resetting the rows on every keystroke
+  useEffect(() => {
+    setRows(mergeStageRows(site, visibility));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [site.updated_at, visibility.updated_at]);
+
+  const names = rows.map((row) => row.stage_name.trim()).filter(Boolean);
+  const hasDuplicates = new Set(names.map((name) => name.toLowerCase())).size !== names.length;
+  // an empty template is valid: new commissions then start stage-less
+  const canSave = !busy && Boolean(site.site_title.trim()) && !hasDuplicates;
+
+  function setRow(index: number, patch: Partial<StageRow>) {
+    setRows(rows.map((row, i) => (i === index ? { ...row, ...patch } : row)));
+  }
+
+  function addRow() {
+    const name = newStage.trim();
+    if (!name) return;
+    setRows([
+      ...rows,
+      { id: newRowId(), stage_name: name, visibility: visibility.default_stage_visibility, note: "" },
+    ]);
+    setNewStage("");
+  }
+
+  function reorder(from: number, to: number) {
+    if (from === to) return;
+    const next = [...rows];
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    setRows(next);
   }
 
   return (
@@ -312,31 +437,158 @@ function SitePanel({
         <div>
           <h1>Site</h1>
           <div className="mono-sm muted">
-            {value.updated_at ? `Updated ${value.updated_at.slice(0, 10)}` : "Default settings"}
+            {site.updated_at ? `Updated ${site.updated_at.slice(0, 10)}` : "Default settings"}
+          </div>
+        </div>
+        <button className="btn primary" disabled={!canSave} onClick={() => onSave(rows)}>
+          {busy ? "Saving…" : "Save site"}
+        </button>
+      </div>
+
+      <div className="settings-panel">
+        <div className="settings-panel-title">General</div>
+        <label style={{ display: "block", maxWidth: 360 }}>
+          <span className="label">Site title</span>
+          <input
+            className="field"
+            value={site.site_title}
+            onChange={(e) => onChange({ ...site, site_title: e.target.value })}
+            placeholder="Commissions"
+            maxLength={120}
+          />
+        </label>
+      </div>
+
+      <div className="settings-panel">
+        <div className="settings-panel-title">Default lifecycle stages</div>
+        <div className="mono-sm muted" style={{ marginBottom: 12 }}>
+          Applied when a commission is created; the first stage renders topmost. Each
+          stage&apos;s visibility is the default for stages of that name.
+        </div>
+        <div className="row gap-8" style={{ marginBottom: 12 }}>
+          <input
+            className="field"
+            style={{ maxWidth: 280 }}
+            placeholder="New stage name (e.g. Lineart)"
+            value={newStage}
+            onChange={(e) => setNewStage(e.target.value.replace(/,/g, ""))}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                addRow();
+              }
+            }}
+          />
+          <button
+            type="button"
+            className="btn sm"
+            onClick={addRow}
+            disabled={busy || !newStage.trim()}
+          >
+            <Plus />
+            Add stage
+          </button>
+        </div>
+        <div className="stage-default-list">
+          {rows.length === 0 && (
+            <div className="mono-sm muted">No stages — new commissions start empty.</div>
+          )}
+          {rows.map((row, index) => (
+            <div
+              key={row.id}
+              className={`stage-default-row${dropIndex === index ? " reorder-target" : ""}`}
+              onDragOver={(e) => {
+                if (!Array.from(e.dataTransfer.types).includes(STAGE_ROW_DRAG_TYPE)) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+                setDropIndex(index);
+              }}
+              onDragLeave={() => setDropIndex((current) => (current === index ? null : current))}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDropIndex(null);
+                if (dragIndex !== null) reorder(dragIndex, index);
+                setDragIndex(null);
+              }}
+            >
+              <button
+                type="button"
+                className="lifecycle-stage-handle"
+                draggable={!busy}
+                disabled={busy}
+                title="Drag to reorder stage"
+                aria-label={`Drag ${row.stage_name || "stage"} to reorder`}
+                onDragStart={(e) => {
+                  e.dataTransfer.setData(STAGE_ROW_DRAG_TYPE, String(index));
+                  e.dataTransfer.effectAllowed = "move";
+                  setDragIndex(index);
+                }}
+                onDragEnd={() => {
+                  setDragIndex(null);
+                  setDropIndex(null);
+                }}
+              >
+                <span className="lifecycle-stage-handle-dots" aria-hidden="true" />
+              </button>
+              <input
+                className="field"
+                value={row.stage_name}
+                placeholder="Delivered"
+                // commas would split the stored template back into stages
+                onChange={(e) => setRow(index, { stage_name: e.target.value.replace(/,/g, "") })}
+              />
+              <select
+                className="field"
+                value={row.visibility}
+                onChange={(e) => setRow(index, { visibility: e.target.value as Visibility })}
+              >
+                <option value="public">Public</option>
+                <option value="private">Private</option>
+              </select>
+              <input
+                className="field"
+                value={row.note}
+                onChange={(e) => setRow(index, { note: e.target.value })}
+                placeholder="note"
+              />
+              <button
+                className="btn sm danger"
+                disabled={busy}
+                onClick={() => setRows(rows.filter((_, i) => i !== index))}
+                title="Remove stage"
+                aria-label="Remove stage"
+              >
+                <X />
+              </button>
+            </div>
+          ))}
+        </div>
+        {hasDuplicates && (
+          <div className="error-text" style={{ marginTop: 8 }}>
+            Stage names must be unique.
+          </div>
+        )}
+      </div>
+
+      <div className="settings-panel">
+        <div className="settings-panel-title">Downloads</div>
+        <div className="settings-list">
+          <div className="settings-list-row">
+            <div>
+              <strong>Allow original downloads</strong>
+              <span className="mono-sm muted">
+                {" "}
+                · when off, visitors only get resampled lossy image variants
+              </span>
+            </div>
+            <ToggleSwitch
+              checked={site.allow_public_original_download}
+              onChange={(next) => onChange({ ...site, allow_public_original_download: next })}
+              label="Allow visitors to download original files"
+            />
           </div>
         </div>
       </div>
-
-      <form className="settings-panel" onSubmit={submit}>
-        <div className="settings-panel-title">Header</div>
-        <div className="settings-form-grid">
-          <label>
-            <span className="label">Site title</span>
-            <input
-              className="field"
-              value={value.site_title}
-              onChange={(e) => onChange({ ...value, site_title: e.target.value })}
-              placeholder="Commissions"
-              maxLength={120}
-            />
-          </label>
-          <div className="settings-form-actions">
-            <button className="btn primary" disabled={busy || !value.site_title.trim()}>
-              {busy ? "Saving…" : "Save site"}
-            </button>
-          </div>
-        </div>
-      </form>
     </section>
   );
 }
@@ -417,6 +669,7 @@ function ApiKeysPanel({
           <strong>New key</strong>
           <code>{createdKey}</code>
           <button className="btn sm" onClick={onCopyCreated}>
+            <Copy />
             Copy
           </button>
         </div>
@@ -494,21 +747,6 @@ function VisibilityPanel({
     onChange({ ...value, fields: { ...value.fields, [field]: next } });
   }
 
-  function setStage(index: number, patch: Partial<{ stage_name: string; visibility: Visibility; note: string }>) {
-    const stage_defaults = value.stage_defaults.map((row, i) =>
-      i === index ? { ...row, ...patch } : row
-    );
-    onChange({ ...value, stage_defaults });
-  }
-
-  function moveStage(index: number, dir: -1 | 1) {
-    const next = [...value.stage_defaults];
-    const target = index + dir;
-    if (target < 0 || target >= next.length) return;
-    [next[index], next[target]] = [next[target], next[index]];
-    onChange({ ...value, stage_defaults: next });
-  }
-
   return (
     <section>
       <div className="settings-heading">
@@ -570,77 +808,10 @@ function VisibilityPanel({
         </div>
       </div>
 
-      <div className="settings-panel">
-        <div className="row" style={{ justifyContent: "space-between", marginBottom: 10 }}>
-          <div className="settings-panel-title" style={{ margin: 0 }}>
-            Stage defaults
-          </div>
-          <button
-            className="btn sm"
-            onClick={() =>
-              onChange({
-                ...value,
-                stage_defaults: [
-                  ...value.stage_defaults,
-                  { stage_name: "", visibility: value.default_stage_visibility, position: value.stage_defaults.length, note: "" },
-                ],
-              })
-            }
-          >
-            + Add stage
-          </button>
-        </div>
-        <div className="stage-default-list">
-          {value.stage_defaults.map((stage, index) => (
-            <div className="stage-default-row" key={`${stage.id ?? "new"}-${index}`}>
-              <input
-                className="field"
-                value={stage.stage_name}
-                onChange={(e) => setStage(index, { stage_name: e.target.value })}
-                placeholder="Delivered"
-              />
-              <select
-                className="field"
-                value={stage.visibility}
-                onChange={(e) => setStage(index, { visibility: e.target.value as Visibility })}
-              >
-                <option value="public">Public</option>
-                <option value="private">Private</option>
-              </select>
-              <input
-                className="field"
-                value={stage.note ?? ""}
-                onChange={(e) => setStage(index, { note: e.target.value })}
-                placeholder="note"
-              />
-              <button className="btn sm" disabled={index === 0} onClick={() => moveStage(index, -1)}>
-                ↑
-              </button>
-              <button
-                className="btn sm"
-                disabled={index === value.stage_defaults.length - 1}
-                onClick={() => moveStage(index, 1)}
-              >
-                ↓
-              </button>
-              <button
-                className="btn sm danger"
-                onClick={() =>
-                  onChange({
-                    ...value,
-                    stage_defaults: value.stage_defaults.filter((_, i) => i !== index),
-                  })
-                }
-              >
-                ✕
-              </button>
-            </div>
-          ))}
-        </div>
-      </div>
-
       <div className="settings-note">
         <strong>Precedence:</strong> global preset → commission override → stage override → file override.
+        Per-stage defaults (template order and visibility) are managed under Site → Default
+        lifecycle stages.
       </div>
     </section>
   );
@@ -666,13 +837,29 @@ function SelectVisibility({
   );
 }
 
-function StoragePanel({ storage }: { storage: StorageSettings }) {
+function StoragePanel({
+  storage,
+  site,
+  busy,
+  onToggleDirectUpload,
+}: {
+  storage: StorageSettings;
+  site: SiteSettings;
+  busy: boolean;
+  onToggleDirectUpload: (next: boolean) => Promise<void>;
+}) {
+  // Only S3-backed deployments can route bytes around the app server. Local
+  // storage has no presigned-PUT analog and stays on the proxied path.
+  const directUploadSupported = storage.backend === "s3";
   return (
     <section>
       <div className="settings-heading">
         <div>
           <h1>Storage</h1>
-          <div className="mono-sm muted">Read-only summary from environment configuration.</div>
+          <div className="mono-sm muted">
+            Backend, bucket, and credentials come from environment configuration.
+            Direct uploads can be toggled live.
+          </div>
         </div>
       </div>
       <div className="settings-panel storage-summary">
@@ -690,7 +877,52 @@ function StoragePanel({ storage }: { storage: StorageSettings }) {
             <code>{storage.local_root}</code>
           </div>
         )}
+        {storage.s3_bucket && (
+          <div>
+            <span className="label">Bucket</span>
+            <code>{storage.s3_bucket}</code>
+          </div>
+        )}
+        {storage.s3_endpoint && (
+          <div>
+            <span className="label">Endpoint</span>
+            <code>{storage.s3_endpoint}</code>
+          </div>
+        )}
+        {storage.cdn_base_url && (
+          <div>
+            <span className="label">CDN base URL</span>
+            <code>{storage.cdn_base_url}</code>
+          </div>
+        )}
       </div>
+
+      {directUploadSupported && (
+        <div className="settings-panel" style={{ marginTop: 16 }}>
+          <div className="row gap-12" style={{ alignItems: "flex-start" }}>
+            <ToggleSwitch
+              checked={site.allow_direct_upload}
+              disabled={busy}
+              onChange={(next) => void onToggleDirectUpload(next)}
+              label="Direct uploads"
+            />
+            <div className="mono-sm muted" style={{ flex: 1 }}>
+              When enabled, browsers PUT file bytes straight to the configured
+              S3 bucket instead of routing them through this app. Requires
+              bucket CORS to allow <code>PUT</code> from the app origin and to
+              expose the <code>ETag</code> header. See
+              {" "}
+              <code>docs/direct-upload-cors.md</code> for provider-specific
+              examples.
+            </div>
+          </div>
+        </div>
+      )}
+      {!directUploadSupported && (
+        <div className="mono-sm muted" style={{ marginTop: 16 }}>
+          Direct uploads are available only with the S3 storage backend.
+        </div>
+      )}
     </section>
   );
 }

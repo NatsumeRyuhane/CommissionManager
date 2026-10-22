@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import enum
-from datetime import date, datetime
+from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
-    Date,
     DateTime,
     Enum,
     Float,
@@ -35,6 +34,11 @@ class Rating(str, enum.Enum):
     general = "general"
     mature = "mature"
     adult = "adult"
+
+
+class CommissionStatus(str, enum.Enum):
+    ongoing = "ongoing"
+    completed = "completed"
 
 
 class StorageBackend(str, enum.Enum):
@@ -176,6 +180,16 @@ class AppSettings(Base):
     site_title: Mapped[str] = mapped_column(
         String(120), nullable=False, default="Commissions"
     )
+    # comma-separated lifecycle stage names applied to new commissions,
+    # in display order (first = topmost)
+    default_stage_names: Mapped[str] = mapped_column(
+        String(500), nullable=False, default="Delivered, Color, Lineart, Sketching"
+    )
+    # when false, visitors get lossy derivatives only: /raw and lossless (png)
+    # derivative formats require write access
+    allow_public_original_download: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True
+    )
     visibility_preset: Mapped[VisibilityPreset] = mapped_column(
         Enum(VisibilityPreset, name="visibility_preset"),
         nullable=False,
@@ -197,11 +211,48 @@ class AppSettings(Base):
     rating_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     characters_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     artists_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    completed_at_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     confirmed_at_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     price_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # When True and the configured backend supports browser-direct uploads, the
+    # frontend skips the proxied multipart endpoint and PUTs bytes straight to the
+    # storage backend. Read per-request — toggle changes take effect for newly
+    # initiated uploads without restarting workers.
+    allow_direct_upload: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class UploadSession(Base):
+    """Pending browser-direct upload. Created when a client requests a presigned
+    URL, finalized after the PUT completes — verification, derivative kickoff,
+    and CommissionFile creation all happen in finalize so a lost finalization
+    can be retried idempotently against the same session id."""
+
+    __tablename__ = "upload_sessions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    node_id: Mapped[int] = mapped_column(
+        ForeignKey("commission_nodes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    storage_backend: Mapped[StorageBackend] = mapped_column(
+        Enum(StorageBackend, name="storage_backend"), nullable=False
+    )
+    storage_bucket: Mapped[str | None] = mapped_column(String)
+    storage_key: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    filename: Mapped[str] = mapped_column(String, nullable=False)
+    content_type: Mapped[str] = mapped_column(String, nullable=False)
+    expected_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    label: Mapped[str | None] = mapped_column(String)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    commission_file_id: Mapped[int | None] = mapped_column(
+        ForeignKey("commission_files.id", ondelete="SET NULL")
     )
 
 
@@ -261,11 +312,18 @@ class CommissionMetadata(Base):
     commission_id: Mapped[int] = mapped_column(
         ForeignKey("commissions.id", ondelete="CASCADE"), nullable=False, unique=True
     )
-    title: Mapped[str] = mapped_column(String, nullable=False)
+    title: Mapped[str | None] = mapped_column(String)
     description: Mapped[str | None] = mapped_column(Text)
-    completed_at: Mapped[date | None] = mapped_column(Date)
     rating: Mapped[Rating] = mapped_column(
         Enum(Rating, name="rating"), nullable=False, default=Rating.general
+    )
+    # commission-level lifecycle status. New commissions start `ongoing`; the
+    # migration backfilled pre-existing rows to `completed` (they predate the
+    # field and are assumed delivered).
+    status: Mapped[CommissionStatus] = mapped_column(
+        Enum(CommissionStatus, name="commission_status"),
+        nullable=False,
+        default=CommissionStatus.ongoing,
     )
     cover_file_id: Mapped[int | None] = mapped_column(
         ForeignKey("commission_files.id", use_alter=True, name="fk_meta_cover_file")
@@ -282,7 +340,6 @@ class CommissionMetadata(Base):
     rating_public_override: Mapped[bool | None] = mapped_column(Boolean)
     characters_public_override: Mapped[bool | None] = mapped_column(Boolean)
     artists_public_override: Mapped[bool | None] = mapped_column(Boolean)
-    completed_at_public_override: Mapped[bool | None] = mapped_column(Boolean)
     confirmed_at_public_override: Mapped[bool | None] = mapped_column(Boolean)
     price_public_override: Mapped[bool | None] = mapped_column(Boolean)
 
@@ -313,11 +370,15 @@ class CommissionNode(Base):
         back_populates="node",
         cascade="all, delete-orphan",
         foreign_keys="CommissionFile.node_id",
+        order_by="CommissionFile.position",
     )
 
 
 class CommissionFile(Base):
     __tablename__ = "commission_files"
+    __table_args__ = (
+        UniqueConstraint("node_id", "position", name="uq_commission_files_node_position"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     node_id: Mapped[int] = mapped_column(
@@ -328,11 +389,13 @@ class CommissionFile(Base):
     )
     format: Mapped[str] = mapped_column(String, nullable=False)
     label: Mapped[str | None] = mapped_column(String)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
     is_image: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     width: Mapped[int | None] = mapped_column(Integer)
     height: Mapped[int | None] = mapped_column(Integer)
     focal_x: Mapped[float | None] = mapped_column(Float)
     focal_y: Mapped[float | None] = mapped_column(Float)
+    focal_zoom: Mapped[float | None] = mapped_column(Float)
     visibility_override: Mapped[Visibility | None] = mapped_column(
         Enum(Visibility, name="visibility")
     )

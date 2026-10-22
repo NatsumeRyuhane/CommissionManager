@@ -25,6 +25,11 @@ Enum rating {
   adult
 }
 
+Enum commission_status {
+  ongoing
+  completed
+}
+
 Enum visibility {
   public
   private
@@ -118,6 +123,8 @@ Table storage_objects {
 Table app_settings {
   id                            integer           [pk]
   site_title                    varchar           [not null, default: 'Commissions']
+  default_stage_names           varchar           [not null, default: 'Delivered, Color, Lineart, Sketching', note: 'comma-separated stage template for new commissions, display order (first = topmost)']
+  allow_public_original_download boolean          [not null, default: true, note: 'when false, visitors get lossy derivatives only: /raw and png derivatives require write access']
   visibility_preset             visibility_preset [not null, default: 'public_by_default']
   default_commission_visibility visibility        [not null, default: 'public']
   default_stage_visibility      visibility        [not null, default: 'private']
@@ -127,12 +134,34 @@ Table app_settings {
   rating_public                 boolean           [not null, default: true]
   characters_public             boolean           [not null, default: true]
   artists_public                boolean           [not null, default: true]
-  completed_at_public           boolean           [not null, default: true]
   confirmed_at_public           boolean           [not null, default: false]
   price_public                  boolean           [not null, default: false]
+  allow_direct_upload           boolean           [not null, default: false, note: 'admin toggle: when true and the configured backend supports it, browsers PUT bytes straight to object storage instead of routing through the app']
   updated_at                    timestamp         [default: `now()`]
 
   Note: 'Singleton admin settings row. Visibility defaults apply to new/public views unless overridden by commission, stage, or file visibility.'
+}
+
+Table upload_sessions {
+  id                  varchar(32)     [pk, note: 'opaque session identifier returned to the client']
+  node_id             integer         [not null, ref: > commission_nodes.id, note: 'destination stage; FK cascades on node delete']
+  storage_backend     storage_backend [not null]
+  storage_bucket      varchar         [note: 'bucket the presign was issued against; null for local backend (which never presigns)']
+  storage_key         varchar         [not null, unique, note: 'pre-generated object key; uniqueness guards against double-finalize creating duplicate files']
+  filename            varchar         [not null]
+  content_type        varchar         [not null]
+  expected_size_bytes bigint          [not null, note: 'client-declared; finalize verifies it against HeadObject before creating records']
+  label               varchar
+  expires_at          timestamp       [not null, note: 'when the presigned URL stops being valid; expired+unfinalized sessions are cleaned up']
+  created_at          timestamp       [default: `now()`]
+  finalized_at        timestamp       [note: 'set when the upload was registered as a CommissionFile; finalization is idempotent on this column']
+  commission_file_id  integer         [ref: > commission_files.id, note: 'populated on finalization; SET NULL if the file is later deleted']
+
+  indexes {
+    node_id
+  }
+
+  Note: 'Pending browser-direct upload. Bytes go straight from the browser to object storage via a presigned PUT; the server creates this row, hands back the URL, and after the PUT verifies the object and creates the CommissionFile.'
 }
 
 Table visibility_stage_defaults {
@@ -179,10 +208,10 @@ Table commissions {
 Table commission_metadata {
   id              integer        [pk, increment]
   commission_id   integer        [not null, ref: - commissions.id, Note: 'One-to-one with commissions']
-  title           varchar        [not null]
+  title           varchar        [Note: 'Nullable; null means untitled and the UI hides it']
   description     text
-  completed_at    date           [Note: 'Completion date of the commission, day-precise']
   rating          rating         [not null, default: 'general']
+  status          commission_status [not null, default: 'ongoing', Note: 'Commission lifecycle status. New rows default to ongoing; rows predating the column were backfilled to completed.']
   cover_file_id   integer        [ref: - commission_files.id, Note: 'Nullable; must point to a commission_file where is_image = true']
   confirmed_at    timestamp      [Note: 'When the commission was accepted/confirmed by the admin']
   price_amount    numeric(12, 2) [Note: 'Agreed commission price']
@@ -194,7 +223,6 @@ Table commission_metadata {
   rating_public_override       boolean
   characters_public_override   boolean
   artists_public_override      boolean
-  completed_at_public_override boolean
   confirmed_at_public_override boolean
   price_public_override        boolean
 
@@ -209,6 +237,7 @@ Table commission_files {
   id                integer   [pk, increment]
   node_id           integer   [not null, ref: > commission_nodes.id, Note: 'Files belong to a node, not directly to a commission. Use the detached node for uncategorized files.']
   storage_object_id integer   [not null, ref: - storage_objects.id]
+  position          integer   [not null, Note: 'Admin-defined ordering within the lifecycle node; lower values come first.']
   format            varchar   [not null, Note: 'File extension: png, jpg, psd, sai2, etc.']
   label             varchar   [Note: 'Optional human-readable description, e.g. "with background", "no watermark", "差分 A"']
   // Image-specific fields — null for non-image files (psd, sai2, design files, etc.)
@@ -217,8 +246,13 @@ Table commission_files {
   height            integer   [Note: 'Pixel height; null when is_image = false']
   focal_x           float     [Note: 'Relative X of the main subject center (0.0–1.0) for thumbnail cropping; null when is_image = false']
   focal_y           float     [Note: 'Relative Y of the main subject center (0.0–1.0) for thumbnail cropping; null when is_image = false']
+  focal_zoom        float     [Note: 'Crop zoom factor (1.0–3.0) applied around the focal point when rendering covers/thumbnails; 1.0 = no zoom, null when is_image = false']
   visibility_override visibility [Note: 'Nullable file-level override. Highest-precedence visibility control for public image filtering, except files in detached nodes are always private.']
   created_at        timestamp [default: `now()`]
+
+  indexes {
+    (node_id, position) [unique]
+  }
 
   Note: 'Any file received as part of a commission: rendered images, source files, design docs, etc. Only files with is_image = true are eligible as cover art.'
 }

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Plus } from "lucide-react";
 import { Link } from "react-router-dom";
 
 import { api } from "../api/client";
@@ -76,7 +77,7 @@ export function CharactersDirectoryPage() {
           {pages.map((p) => (
             <Link key={p.character_id} to={`/characters/${p.character_id}`} className="char-directory-card">
               <div className="face">
-                <Cover cover={p.main_reference?.cover ?? null} rounded={false} />
+                <Cover cover={p.main_reference?.cover ?? null} rounded={false} size="thumb" />
               </div>
               <div className="meta">
                 <h3>{p.character_name}</h3>
@@ -96,7 +97,8 @@ export function CharactersDirectoryPage() {
           <div className="row wrap gap-4" style={{ marginTop: 6 }}>
             {characterByIdWithoutPage.map((c) => (
               <Link key={c.id} to={`/characters/${c.id}`} className="btn sm">
-                + {c.name}
+                <Plus />
+                {c.name}
               </Link>
             ))}
           </div>

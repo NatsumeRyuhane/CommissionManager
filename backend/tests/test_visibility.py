@@ -131,7 +131,6 @@ def test_public_lifecycle_omits_private_stages_and_files(admin_client: TestClien
     assert {
         file["id"] for node in admin_detail["nodes"] for file in node["files"]
     } == {public_image["id"], hidden_image["id"], review_image["id"]}
-    assert admin_detail["current_stage"] == "Review"
 
     admin_client.cookies.clear()
 
@@ -140,7 +139,6 @@ def test_public_lifecycle_omits_private_stages_and_files(admin_client: TestClien
     body = public_detail.json()
     assert [node["name"] for node in body["nodes"]] == ["Delivered"]
     assert [file["id"] for file in body["nodes"][0]["files"]] == [public_image["id"]]
-    assert body["current_stage"] == "Delivered"
 
     public_nodes = admin_client.get(f"/api/v1/commissions/{commission['id']}/nodes")
     assert public_nodes.status_code == 200
@@ -185,11 +183,49 @@ def test_detached_node_and_files_cannot_be_public(admin_client: TestClient):
 
     admin_client.cookies.clear()
     assert admin_client.get(detached_image["url"]).status_code == 404
-    assert admin_client.get(f"/api/v1/commissions/{commission['id']}/images").json() == []
-    assert all(
-        not node["is_detached"]
-        for node in admin_client.get(f"/api/v1/commissions/{commission['id']}").json()["nodes"]
+    # the only file is detached (private), so visitors don't see the
+    # commission at all — not even an empty shell
+    assert admin_client.get(f"/api/v1/commissions/{commission['id']}/images").status_code == 404
+    assert admin_client.get(f"/api/v1/commissions/{commission['id']}").status_code == 404
+
+
+def test_per_commission_title_description_visibility_overrides_are_locked(
+    admin_client: TestClient,
+):
+    """Title and description per-commission overrides aren't configurable —
+    the site-wide default applies. A hidden title on an otherwise-public
+    commission would look broken to a reader, and the tighter coupling
+    between commission visibility and these fields means the override knob
+    just generates UX inconsistencies. `null` is still accepted (that's the
+    "inherit" value the frontend round-trips on every save); only non-null
+    overrides are rejected so an agent (or stale frontend) can't bypass."""
+    created = admin_client.post(
+        "/api/v1/commissions", json={"title": "Locked-field test"}
     )
+    assert created.status_code == 201, created.text
+    cid = created.json()["id"]
+
+    for field in ("title", "description"):
+        for value in (True, False):
+            res = admin_client.patch(
+                f"/api/v1/commissions/{cid}/visibility",
+                json={"fields": {field: value}},
+            )
+            assert res.status_code == 422, (field, value, res.text)
+            assert field in res.json()["detail"]
+            assert "not configurable" in res.json()["detail"]
+
+    # null/inherit (the legitimate state) round-trips cleanly so the frontend's
+    # full-field-map save flow keeps working
+    res = admin_client.patch(
+        f"/api/v1/commissions/{cid}/visibility",
+        json={"fields": {"title": None, "description": None, "labels": True}},
+    )
+    assert res.status_code == 200, res.text
+    fields = {f["field"]: f for f in res.json()["fields"]}
+    assert fields["title"]["public"] is None
+    assert fields["description"]["public"] is None
+    assert fields["labels"]["public"] is True
 
 
 def test_public_detail_redacts_fields_marked_private(admin_client: TestClient):
@@ -198,7 +234,6 @@ def test_public_detail_redacts_fields_marked_private(admin_client: TestClient):
         json={
             "title": "Sensitive title",
             "description": "private notes",
-            "completed_at": "2026-05-01",
             "confirmed_at": "2026-04-20T12:00:00Z",
             "price_amount": "125.00",
             "price_currency": "USD",
@@ -215,17 +250,22 @@ def test_public_detail_redacts_fields_marked_private(admin_client: TestClient):
     delivered = _node(commission, "Delivered")
     image = _upload_image(admin_client, delivered["id"], "delivered.png", "#111111")
 
+    # Title and description aren't configurable per-commission anymore — flip
+    # them at the site level so the redaction check still has something to
+    # assert against.
+    site = admin_client.patch(
+        "/api/v1/settings/visibility",
+        json={"fields": {"title": False, "description": False}},
+    )
+    assert site.status_code == 200, site.text
     patched = admin_client.patch(
         f"/api/v1/commissions/{commission['id']}/visibility",
         json={
             "fields": {
-                "title": False,
-                "description": False,
                 "labels": False,
                 "rating": False,
                 "characters": False,
                 "artists": False,
-                "completed_at": False,
                 "confirmed_at": False,
                 "price": False,
             }
@@ -239,7 +279,6 @@ def test_public_detail_redacts_fields_marked_private(admin_client: TestClient):
     public_item = listed.json()[0]
     assert public_item["title"] == f"#{commission['id']}"
     assert public_item["rating"] is None
-    assert public_item["completed_at"] is None
     assert public_item["categories"] == []
     assert public_item["tags"] == []
     assert public_item["characters"] == []
@@ -266,3 +305,45 @@ def test_public_detail_redacts_fields_marked_private(admin_client: TestClient):
     assert admin_detail["characters"] == ["Heiyao"]
     assert admin_detail["description"] == "private notes"
     assert admin_detail["price_amount"] == "125.00"
+
+
+def test_commission_without_public_files_is_hidden_from_visitors(admin_client: TestClient):
+    # no files at all
+    empty = admin_client.post(
+        "/api/v1/commissions",
+        json={"title": "Empty", "node_names": ["Delivered"]},
+    ).json()
+    # one file, but its stage is private
+    hidden = admin_client.post(
+        "/api/v1/commissions",
+        json={"title": "Hidden file", "node_names": ["Delivered"]},
+    ).json()
+    hidden_image = _upload_image(admin_client, _node(hidden, "Delivered")["id"], "h.png", "#111111")
+    res = admin_client.patch(
+        f"/api/v1/commissions/{hidden['id']}/visibility",
+        json={"files": {hidden_image["id"]: "private"}},
+    )
+    assert res.status_code == 200, res.text
+    # one public file
+    shown = admin_client.post(
+        "/api/v1/commissions",
+        json={"title": "Shown", "node_names": ["Delivered"]},
+    ).json()
+    _upload_image(admin_client, _node(shown, "Delivered")["id"], "s.png", "#222222")
+
+    admin_list = admin_client.get("/api/v1/commissions")
+    assert {item["id"] for item in admin_list.json()} == {empty["id"], hidden["id"], shown["id"]}
+
+    admin_client.cookies.clear()
+    public_list = admin_client.get("/api/v1/commissions")
+    assert [item["id"] for item in public_list.json()] == [shown["id"]]
+    assert admin_client.get(f"/api/v1/commissions/{empty['id']}").status_code == 404
+    assert admin_client.get(f"/api/v1/commissions/{hidden['id']}").status_code == 404
+    assert admin_client.get(f"/api/v1/commissions/{shown['id']}").status_code == 200
+
+    login = admin_client.post(
+        "/api/v1/auth/login",
+        json={"username": settings.admin_username, "password": settings.admin_password},
+    )
+    assert login.status_code == 200
+    assert admin_client.get(f"/api/v1/commissions/{empty['id']}").status_code == 200

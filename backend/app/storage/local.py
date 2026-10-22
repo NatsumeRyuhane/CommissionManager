@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import mimetypes
 from pathlib import Path
+from uuid import uuid4
 
-from app.storage.base import StorageBackendDriver, StoredFile
+from app.storage.base import ObjectMetadata, StorageBackendDriver, StoredFile
 
 
 class LocalStorage(StorageBackendDriver):
@@ -24,7 +26,10 @@ class LocalStorage(StorageBackendDriver):
     def save(self, key: str, data: bytes) -> StoredFile:
         p = self._path(key)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(data)
+        # write-then-rename so concurrent readers never observe partial bytes
+        tmp = p.with_name(f".{p.name}.{uuid4().hex}.tmp")
+        tmp.write_bytes(data)
+        tmp.replace(p)
         return StoredFile(
             backend=self.backend_name,
             bucket=None,
@@ -41,3 +46,15 @@ class LocalStorage(StorageBackendDriver):
 
     def exists(self, key: str, *, bucket: str | None = None) -> bool:
         return self._path(key).exists()
+
+    def head_object(
+        self, key: str, *, bucket: str | None = None
+    ) -> ObjectMetadata | None:
+        path = self._path(key)
+        if not path.exists():
+            return None
+        return ObjectMetadata(
+            size_bytes=path.stat().st_size,
+            content_type=mimetypes.guess_type(key)[0],
+            etag=None,
+        )

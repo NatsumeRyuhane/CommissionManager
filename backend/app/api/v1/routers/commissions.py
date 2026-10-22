@@ -6,10 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from app import images
 from app.api.v1 import crud
 from app.auth.deps import Principal, get_principal, require_edit
 from app.db import get_db
-from app.models import Commission, Visibility
+from app.models import Commission, CommissionFile, StorageObject, Visibility
 from app.schemas import (
     CommissionCreate,
     CommissionDetail,
@@ -20,6 +21,7 @@ from app.schemas import (
     CopyJsonOut,
     FileOut,
 )
+from app.storage import get_storage
 
 router = APIRouter(prefix="/commissions", tags=["commissions"])
 
@@ -61,10 +63,11 @@ def _assert_commission_visible(
     visibility_context: crud.VisibilityContext,
     principal: Principal | None,
 ) -> None:
-    if (
-        crud.effective_commission_visibility(commission, visibility_context) != Visibility.public
-        and not _can_view_private(principal)
-    ):
+    if _can_view_private(principal):
+        return
+    if crud.effective_commission_visibility(
+        commission, visibility_context
+    ) != Visibility.public or not crud.has_public_file(commission, visibility_context):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Commission not found")
 
 
@@ -78,6 +81,7 @@ def list_commissions(
     categories: list[str] = Query(default=[]),
     tags: list[str] = Query(default=[]),
     rating: list[str] = Query(default=[]),
+    status: list[str] = Query(default=[]),
     characters: list[str] = Query(default=[]),
     artists: list[str] = Query(default=[]),
     formats: list[str] = Query(default=[]),
@@ -105,24 +109,29 @@ def list_commissions(
                 haystack.append(meta.description or "")
             if needle not in " \n".join(haystack).lower():
                 return False
-        cats = crud.categories_of(c)
-        tgs = crud.tags_of(c)
-        if categories and not set(categories) & set(cats):
+        # taxonomy filters support the "(none)" sentinel (match records with
+        # nothing set) alongside concrete values, combined with OR
+        if not crud.matches_multi_filter(categories, crud.categories_of(c)):
             return False
-        if tags and not set(tags) & set(tgs):
+        if not crud.matches_multi_filter(tags, crud.tags_of(c)):
+            return False
+        if not crud.matches_multi_filter(characters, [ch.name for ch in c.characters]):
+            return False
+        if not crud.matches_multi_filter(artists, [a.name for a in c.artists]):
             return False
         if rating and (not meta or meta.rating.value not in rating):
             return False
-        if characters and not set(characters) & {ch.name for ch in c.characters}:
-            return False
-        if artists and not set(artists) & {a.name for a in c.artists}:
+        # status is always set, so it has no "(none)" option — plain membership
+        if status and (not meta or meta.status.value not in status):
             return False
         if formats and not set(formats) & set(crud.formats_of(c)):
             return False
-        if date_from and (not meta or not meta.completed_at or meta.completed_at < date_from):
-            return False
-        if date_to and (not meta or not meta.completed_at or meta.completed_at > date_to):
-            return False
+        if date_from or date_to:
+            commission_date = crud.commission_date(c)
+            if date_from and (commission_date is None or commission_date < date_from):
+                return False
+            if date_to and (commission_date is None or commission_date > date_to):
+                return False
         n_chars = len(c.characters)
         if char_min is not None and n_chars < char_min:
             return False
@@ -132,17 +141,21 @@ def list_commissions(
 
     filtered = [c for c in items if keep(c)]
     if not _can_view_private(principal):
+        # a public commission with nothing public to show (no files, or only
+        # private ones) is hidden from visitors entirely
         filtered = [
             c
             for c in filtered
             if crud.effective_commission_visibility(c, visibility_context) == Visibility.public
+            and crud.has_public_file(c, visibility_context)
         ]
 
     def sort_key(c: Commission):
         meta = c.meta
         if sort == "title":
             return (meta.title or "").lower() if meta else ""
-        return (meta.completed_at or date.min) if meta else date.min
+        # "date" sorts by the latest update: the topmost stage's start date
+        return crud.commission_date(c) or date.min
 
     filtered.sort(key=sort_key, reverse=(order == "desc"))
     response.headers["X-Total-Count"] = str(len(filtered))
@@ -208,11 +221,36 @@ def delete_commission(
     _: Principal = Depends(require_edit),
 ):
     commission = _get_one(db, commission_id)
+    object_ids = {
+        file.storage_object_id for node in commission.nodes for file in node.files
+    }
     # cover_file_id references a file we're about to cascade-delete; clear it first
     if commission.meta:
         commission.meta.cover_file_id = None
         db.flush()
     db.delete(commission)
+    db.flush()
+    # clean up stored bytes (originals + cached derivatives) for storage objects
+    # that no remaining file references
+    if object_ids:
+        still_used = set(
+            db.scalars(
+                select(CommissionFile.storage_object_id).where(
+                    CommissionFile.storage_object_id.in_(object_ids)
+                )
+            )
+        )
+        storage = get_storage()
+        for object_id in object_ids - still_used:
+            obj = db.get(StorageObject, object_id)
+            if obj is None:
+                continue
+            try:
+                storage.delete(obj.key, bucket=obj.bucket)
+            except OSError:
+                pass
+            images.delete_derivatives(storage, obj.id, obj.checksum)
+            db.delete(obj)
     db.commit()
 
 
@@ -290,7 +328,25 @@ def update_commission_visibility(
     if "visibility" in body.model_fields_set and commission.meta is not None:
         commission.meta.visibility_override = body.visibility
     if body.fields is not None and commission.meta is not None:
-        for field, value in body.fields.model_dump(exclude_unset=True).items():
+        provided = body.fields.model_dump(exclude_unset=True)
+        # Per-commission overrides don't make sense for these fields: title
+        # and description live tightly with the commission's overall public/
+        # private state, so configuring them independently per-record only
+        # creates inconsistent surfaces (a "public" commission with a hidden
+        # title looks broken to readers). The site-wide default still applies;
+        # only the per-record override is locked. `null` is allowed because
+        # the frontend sends the full field map on Save and inherit-as-null
+        # is the legitimate value here.
+        for immutable in ("title", "description"):
+            if immutable in provided and provided[immutable] is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=(
+                        f"Per-commission visibility override for '{immutable}' "
+                        "is not configurable; the site-wide default applies."
+                    ),
+                )
+        for field, value in provided.items():
             setattr(commission.meta, crud.FIELD_OVERRIDE_ATTRS[field], value)
 
     nodes_by_id = {node.id: node for node in commission.nodes}

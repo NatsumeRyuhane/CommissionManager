@@ -1,4 +1,5 @@
 export type Rating = "general" | "mature" | "adult";
+export type CommissionStatus = "ongoing" | "completed";
 export type LabelType = "category" | "tag" | "rating";
 export type Visibility = "public" | "private";
 export type VisibilityPreset = "public_by_default" | "private_by_default" | "custom";
@@ -9,24 +10,31 @@ export type VisibilityFieldKey =
   | "rating"
   | "characters"
   | "artists"
-  | "completed_at"
   | "confirmed_at"
   | "price";
+
+export type ImagePreset = "thumb" | "small" | "medium" | "large";
+
+/** Preset name -> server-side derivative URL (/files/{id}/image?size=...). */
+export type ImageUrls = Partial<Record<ImagePreset, string>>;
 
 export interface Cover {
   file_id: number;
   url: string;
+  image_urls: ImageUrls | null;
   width: number | null;
   height: number | null;
   focal_x: number | null;
   focal_y: number | null;
+  focal_zoom: number | null;
 }
 
 export interface CommissionListItem {
   id: number;
-  title: string;
+  /** Null means untitled; surfaces hide it instead of showing a placeholder. */
+  title: string | null;
   rating: Rating | null;
-  completed_at: string | null;
+  status: CommissionStatus | null;
   visibility: Visibility | null;
   effective_visibility: Visibility | null;
   categories: string[];
@@ -34,13 +42,13 @@ export interface CommissionListItem {
   characters: string[];
   artists: string[];
   formats: string[];
-  current_stage: string | null;
   cover: Cover | null;
 }
 
 export interface CommissionFile {
   id: number;
   node_id: number;
+  position: number;
   format: string;
   label: string | null;
   is_image: boolean;
@@ -48,9 +56,11 @@ export interface CommissionFile {
   height: number | null;
   focal_x: number | null;
   focal_y: number | null;
+  focal_zoom: number | null;
   visibility: Visibility | null;
   effective_visibility: Visibility | null;
   url: string;
+  image_urls: ImageUrls | null;
   is_cover: boolean;
 }
 
@@ -76,10 +86,11 @@ export interface CommissionDetail extends CommissionListItem {
 }
 
 export interface CommissionCreate {
-  title: string;
+  /** Omitted, null, or blank stores NULL server-side (untitled). */
+  title?: string | null;
   description?: string | null;
-  completed_at?: string | null;
   rating?: Rating;
+  status?: CommissionStatus;
   confirmed_at?: string | null;
   price_amount?: string | null;
   price_currency?: string | null;
@@ -106,6 +117,7 @@ export interface ListParams {
   categories?: string[];
   tags?: string[];
   rating?: string[];
+  status?: string[];
   characters?: string[];
   artists?: string[];
   formats?: string[];
@@ -206,16 +218,53 @@ export interface VisibilitySettingsUpdate {
 export interface StorageSettings {
   backend: string;
   local_root: string | null;
+  s3_bucket: string | null;
+  s3_endpoint: string | null;
+  cdn_base_url: string | null;
   configurable_via: string;
 }
 
 export interface SiteSettings {
   site_title: string;
+  /** Stage template for new commissions, display order (first = topmost). */
+  default_stage_names: string[];
+  /** When false, visitors get lossy derivatives only (no /raw, no png). */
+  allow_public_original_download: boolean;
+  /** When true and the backend supports it, uploads bypass the app server. */
+  allow_direct_upload: boolean;
   updated_at: string | null;
 }
 
 export interface SiteSettingsUpdate {
   site_title?: string | null;
+  default_stage_names?: string[] | null;
+  allow_public_original_download?: boolean | null;
+  allow_direct_upload?: boolean | null;
+}
+
+export interface StorageCapabilities {
+  backend: string;
+  /** Direct uploads are usable right now (backend + env + admin toggle all green). */
+  direct_upload_available: boolean;
+  /** Reflects the admin toggle alone, independent of backend support. */
+  direct_upload_enabled: boolean;
+  /** The backend itself supports direct uploads (s3 with env switch on). */
+  direct_upload_supported: boolean;
+}
+
+export interface UploadSessionRequest {
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  label?: string | null;
+}
+
+export interface UploadSessionResponse {
+  session_id: string;
+  upload_url: string;
+  upload_method: string;
+  upload_headers: Record<string, string>;
+  expires_at: string;
 }
 
 export interface CommissionVisibilityField {
@@ -261,7 +310,6 @@ export interface CharacterPageCommission {
   commission_id: number;
   title: string;
   cover: Cover | null;
-  completed_at: string | null;
 }
 
 export interface CharacterPageSetItem {

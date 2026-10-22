@@ -1,12 +1,19 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.models import LabelType, Rating, Visibility, VisibilityPreset, WebhookEvent
+from app.models import (
+    CommissionStatus,
+    LabelType,
+    Rating,
+    Visibility,
+    VisibilityPreset,
+    WebhookEvent,
+)
 
 
 # ---------------------------------------------------------------- auth
@@ -236,6 +243,7 @@ class AliasCreate(BaseModel):
 class FileOut(BaseModel):
     id: int
     node_id: int
+    position: int
     format: str
     label: str | None = None
     is_image: bool
@@ -243,9 +251,12 @@ class FileOut(BaseModel):
     height: int | None = None
     focal_x: float | None = None
     focal_y: float | None = None
+    focal_zoom: float | None = None
     visibility: Visibility | None = None
     effective_visibility: Visibility | None = None
     url: str
+    # preset name -> derivative URL (/files/{id}/image?size=...); None for non-images
+    image_urls: dict[str, str] | None = None
     is_cover: bool = False
 
 
@@ -260,6 +271,10 @@ class UploadProgressOut(BaseModel):
     total_bytes: int | None = None
     percentage: int | None = None
     detail: str | None = None
+
+
+class FileReorder(BaseModel):
+    file_ids: list[int]
 
 
 class NodeOut(BaseModel):
@@ -299,18 +314,21 @@ class NodeReorder(BaseModel):
 class CoverOut(BaseModel):
     file_id: int
     url: str
+    # preset name -> derivative URL (/files/{id}/image?size=...)
+    image_urls: dict[str, str] | None = None
     width: int | None = None
     height: int | None = None
     focal_x: float | None = None
     focal_y: float | None = None
+    focal_zoom: float | None = None
 
 
 # ---------------------------------------------------------------- commission output
 class CommissionListItem(BaseModel):
     id: int
-    title: str
+    title: str | None = None
     rating: Rating | None = None
-    completed_at: date | None = None
+    status: CommissionStatus | None = None
     visibility: Visibility | None = None
     effective_visibility: Visibility | None = None
     categories: list[str] = []
@@ -318,7 +336,6 @@ class CommissionListItem(BaseModel):
     characters: list[str] = []
     artists: list[str] = []
     formats: list[str] = []
-    current_stage: str | None = None
     cover: CoverOut | None = None
 
 
@@ -334,10 +351,10 @@ class CommissionDetail(CommissionListItem):
 
 # ---------------------------------------------------------------- commission input
 class CommissionCreate(BaseModel):
-    title: str
+    title: str | None = None
     description: str | None = None
-    completed_at: date | None = None
     rating: Rating = Rating.general
+    status: CommissionStatus = CommissionStatus.ongoing
     confirmed_at: datetime | None = None
     price_amount: Decimal | None = None
     price_currency: str | None = None
@@ -348,12 +365,19 @@ class CommissionCreate(BaseModel):
     artist_names: list[str] = []
     node_names: list[str] = []
 
+    @field_validator("title")
+    @classmethod
+    def blank_title_means_none(cls, title: str | None) -> str | None:
+        if title is None:
+            return None
+        return title.strip() or None
+
 
 class CommissionUpdate(BaseModel):
     title: str | None = None
     description: str | None = None
-    completed_at: date | None = None
     rating: Rating | None = None
+    status: CommissionStatus | None = None
     confirmed_at: datetime | None = None
     price_amount: Decimal | None = None
     price_currency: str | None = None
@@ -364,21 +388,26 @@ class CommissionUpdate(BaseModel):
     character_names: list[str] | None = None
     artist_names: list[str] | None = None
 
+    @field_validator("title")
+    @classmethod
+    def blank_title_means_none(cls, title: str | None) -> str | None:
+        # omitting the field leaves the title unchanged (model_fields_set decides);
+        # an explicit null or blank string clears it
+        if title is None:
+            return None
+        return title.strip() or None
+
 
 # ---------------------------------------------------------------- agent payload
 class CopyJsonOut(BaseModel):
-    # `date` field name would shadow the `date` type during annotation eval, so use an alias
-    model_config = ConfigDict(populate_by_name=True)
     id: int
     title: str
-    completed_date: date | None = Field(default=None, alias="date")
     confirmed_at: datetime | None = None
     category: str | None = None
     rating: Rating
     tags: list[str] = []
     characters: list[str] = []
     artists: list[str] = []
-    current_stage: str | None = None
     files_endpoint: str
     public_images_endpoint: str
 
@@ -412,7 +441,6 @@ class VisibilityFieldDefaults(BaseModel):
     rating: bool
     characters: bool
     artists: bool
-    completed_at: bool
     confirmed_at: bool
     price: bool
 
@@ -424,7 +452,6 @@ class VisibilityFieldDefaultsPatch(BaseModel):
     rating: bool | None = None
     characters: bool | None = None
     artists: bool | None = None
-    completed_at: bool | None = None
     confirmed_at: bool | None = None
     price: bool | None = None
 
@@ -459,11 +486,17 @@ class VisibilitySettingsUpdate(BaseModel):
 
 class SiteSettingsOut(BaseModel):
     site_title: str
+    default_stage_names: list[str]
+    allow_public_original_download: bool
+    allow_direct_upload: bool
     updated_at: datetime | None = None
 
 
 class SiteSettingsUpdate(BaseModel):
     site_title: str | None = Field(default=None, max_length=120)
+    default_stage_names: list[str] | None = None
+    allow_public_original_download: bool | None = None
+    allow_direct_upload: bool | None = None
 
     @field_validator("site_title")
     @classmethod
@@ -474,6 +507,21 @@ class SiteSettingsUpdate(BaseModel):
         if not title:
             raise ValueError("site_title must not be empty")
         return title
+
+    @field_validator("default_stage_names")
+    @classmethod
+    def stage_names_must_not_be_blank(cls, names: list[str] | None) -> list[str] | None:
+        if names is None:
+            return None
+        cleaned = [name.strip() for name in names if name.strip()]
+        # the template persists comma-separated, so a comma inside a name would
+        # split into separate stages on the way back out
+        if any("," in name for name in cleaned):
+            raise ValueError("stage names must not contain commas")
+        # mirror the stored ", ".join(...) form: n - 1 two-character separators
+        if sum(len(name) for name in cleaned) + 2 * max(0, len(cleaned) - 1) > 500:
+            raise ValueError("default_stage_names is too long")
+        return cleaned
 
 
 class VisibilityFieldState(BaseModel):
@@ -518,7 +566,72 @@ class CommissionVisibilityUpdate(BaseModel):
 class StorageSettingsOut(BaseModel):
     backend: str
     local_root: str | None = None
+    s3_bucket: str | None = None
+    s3_endpoint: str | None = None
+    cdn_base_url: str | None = None
     configurable_via: str = "environment"
+
+
+class StorageCapabilitiesOut(BaseModel):
+    """Runtime storage capabilities — drives whether the frontend uses the proxied
+    multipart endpoint or the browser-direct upload flow."""
+
+    backend: str
+    # Whether browsers may begin direct uploads right now: requires the backend to
+    # support it, the env-level kill switch to be on, and the admin toggle to be on.
+    direct_upload_available: bool
+    # Reflects the admin toggle alone — distinguishes "operator turned it off" from
+    # "this backend can't support it" so the settings UI shows the right hint.
+    direct_upload_enabled: bool
+    # True when the runtime backend supports direct uploads at all (s3, with the
+    # env kill switch on). Lets the settings UI explain why the toggle is disabled.
+    direct_upload_supported: bool
+
+
+class UploadSessionCreate(BaseModel):
+    filename: str = Field(min_length=1, max_length=512)
+    content_type: str = Field(min_length=1, max_length=255)
+    size_bytes: int = Field(gt=0)
+    label: str | None = Field(default=None, max_length=255)
+
+    @field_validator("filename")
+    @classmethod
+    def _strip_filename(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("filename must not be empty")
+        # The filename becomes the trailing segment of the object key; '/'
+        # would let the client point at a different directory than the
+        # server-generated key prefix expects.
+        if "/" in value or "\\" in value:
+            raise ValueError("filename must not contain path separators")
+        return value
+
+
+class UploadSessionOut(BaseModel):
+    session_id: str
+    upload_url: str
+    upload_method: str
+    upload_headers: dict[str, str]
+    expires_at: datetime
+
+
+class UploadSessionStatusOut(BaseModel):
+    """Agent-facing view of a pending or finalized upload session. The derived
+    `is_expired` / `is_finalized` flags keep callers from having to compare
+    timestamps client-side."""
+
+    session_id: str
+    node_id: int
+    filename: str
+    content_type: str
+    expected_size_bytes: int
+    created_at: datetime
+    expires_at: datetime
+    finalized_at: datetime | None
+    commission_file_id: int | None
+    is_expired: bool
+    is_finalized: bool
 
 
 class WebhookCreate(BaseModel):
@@ -567,7 +680,6 @@ class CharacterPageCommission(BaseModel):
     commission_id: int
     title: str
     cover: CoverOut | None = None
-    completed_at: date | None = None
 
 
 class CharacterPageSetItemOut(BaseModel):

@@ -28,7 +28,10 @@ import type {
   Paged,
   SiteSettings,
   SiteSettingsUpdate,
+  StorageCapabilities,
   StorageSettings,
+  UploadSessionRequest,
+  UploadSessionResponse,
   VisibilitySettings,
   VisibilitySettingsUpdate,
 } from "./types";
@@ -68,7 +71,7 @@ function toQuery(params: ListParams): string {
   if (params.order) sp.set("order", params.order);
   if (params.limit != null) sp.set("limit", String(params.limit));
   if (params.offset != null) sp.set("offset", String(params.offset));
-  for (const key of ["categories", "tags", "rating", "characters", "artists", "formats"] as const) {
+  for (const key of ["categories", "tags", "rating", "status", "characters", "artists", "formats"] as const) {
     for (const v of params[key] ?? []) sp.append(key, v);
   }
   const s = sp.toString();
@@ -96,6 +99,83 @@ async function uploadForm<T>(path: string, form: FormData, method = "POST"): Pro
     throw new ApiError(res.status, detail);
   }
   return res.json() as Promise<T>;
+}
+
+function uploadFormWithProgress<T>(
+  path: string,
+  form: FormData,
+  onProgress?: (percentage: number) => void,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${BASE}${path}`);
+    xhr.withCredentials = true;
+    xhr.responseType = "json";
+
+    xhr.upload.addEventListener("progress", (event) => {
+      if (!event.lengthComputable) return;
+      onProgress?.(Math.min(100, Math.round((event.loaded / event.total) * 100)));
+    });
+    xhr.addEventListener("load", () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(xhr.response as T);
+        return;
+      }
+      const detail =
+        typeof xhr.response?.detail === "string" ? xhr.response.detail : xhr.statusText;
+      reject(new ApiError(xhr.status, detail || "Upload failed"));
+    });
+    xhr.addEventListener("error", () => {
+      reject(new ApiError(0, "Upload failed because of a network error"));
+    });
+    xhr.send(form);
+  });
+}
+
+/** PUT raw bytes to an arbitrary URL (typically a presigned S3 endpoint) with
+ * per-byte progress reporting. We treat status 0 as a likely CORS failure so the
+ * UI can surface a configuration-aware error instead of a generic "network error". */
+export function directPutWithProgress(
+  url: string,
+  body: Blob,
+  options: {
+    headers?: Record<string, string>;
+    onProgress?: (percentage: number) => void;
+  } = {},
+): Promise<{ status: number; etag: string | null }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", url);
+    // Presigned URLs are pre-authenticated; sending app cookies is unnecessary
+    // and can break the request on cross-origin S3 endpoints.
+    xhr.withCredentials = false;
+    for (const [name, value] of Object.entries(options.headers ?? {})) {
+      xhr.setRequestHeader(name, value);
+    }
+    xhr.upload.addEventListener("progress", (event) => {
+      if (!event.lengthComputable) return;
+      options.onProgress?.(Math.min(100, Math.round((event.loaded / event.total) * 100)));
+    });
+    xhr.addEventListener("load", () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve({ status: xhr.status, etag: xhr.getResponseHeader("ETag") });
+        return;
+      }
+      reject(new ApiError(xhr.status, `Direct upload rejected with status ${xhr.status}`));
+    });
+    xhr.addEventListener("error", () => {
+      // status 0 + no response usually means CORS preflight failed or the host
+      // is unreachable — the message is intentionally specific so callers can
+      // distinguish it from a routine HTTP error.
+      reject(
+        new ApiError(
+          0,
+          "Direct upload failed — bucket CORS may not be configured for this origin.",
+        ),
+      );
+    });
+    xhr.send(body);
+  });
 }
 
 export const api = {
@@ -152,6 +232,19 @@ export const api = {
       body: JSON.stringify(body),
     }),
   getStorageSettings: () => request<StorageSettings>("/settings/storage"),
+  getStorageCapabilities: () =>
+    request<StorageCapabilities>("/settings/storage/capabilities"),
+
+  // direct-to-S3 upload session lifecycle
+  createUploadSession: (nodeId: number, body: UploadSessionRequest) =>
+    request<UploadSessionResponse>(`/nodes/${nodeId}/uploads`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  finalizeUpload: (sessionId: string) =>
+    request<CommissionFile>(`/uploads/${sessionId}/finalize`, { method: "POST" }),
+  cancelUpload: (sessionId: string) =>
+    request<void>(`/uploads/${sessionId}`, { method: "DELETE" }),
 
   // lifecycle nodes
   listNodes: (commissionId: number) =>
@@ -181,11 +274,19 @@ export const api = {
   deleteNode: (nodeId: number) => request<void>(`/nodes/${nodeId}`, { method: "DELETE" }),
 
   // files
-  uploadFile: (nodeId: number, file: File, label?: string) => {
+  uploadFile: (
+    nodeId: number,
+    file: File,
+    options: { label?: string; onProgress?: (percentage: number) => void } = {},
+  ) => {
     const form = new FormData();
     form.append("upload", file);
-    if (label) form.append("label", label);
-    return uploadForm<CommissionFile>(`/nodes/${nodeId}/files`, form);
+    if (options.label) form.append("label", options.label);
+    return uploadFormWithProgress<CommissionFile>(
+      `/nodes/${nodeId}/files`,
+      form,
+      options.onProgress,
+    );
   },
   deleteFile: (fileId: number) => request<void>(`/files/${fileId}`, { method: "DELETE" }),
   moveFile: (fileId: number, nodeId: number) =>
@@ -193,10 +294,16 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ node_id: nodeId }),
     }),
-  setFocal: (fileId: number, focalX: number, focalY: number) => {
+  reorderFiles: (nodeId: number, fileIds: number[]) =>
+    request<CommissionFile[]>(`/nodes/${nodeId}/files/reorder`, {
+      method: "POST",
+      body: JSON.stringify({ file_ids: fileIds }),
+    }),
+  setFocal: (fileId: number, focalX: number, focalY: number, focalZoom?: number) => {
     const form = new FormData();
     form.append("focal_x", String(focalX));
     form.append("focal_y", String(focalY));
+    if (focalZoom != null) form.append("focal_zoom", String(focalZoom));
     return uploadForm<CommissionFile>(`/files/${fileId}/focal`, form, "PATCH");
   },
 

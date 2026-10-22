@@ -36,6 +36,31 @@ def test_login_grants_write(admin_client: TestClient):
     assert me["can_write"] is True
 
 
+def test_title_is_nullable(admin_client: TestClient):
+    omitted = admin_client.post("/api/v1/commissions", json={})
+    assert omitted.status_code == 201, omitted.text
+    assert omitted.json()["title"] is None
+
+    blank = admin_client.post("/api/v1/commissions", json={"title": "   "})
+    assert blank.status_code == 201, blank.text
+    assert blank.json()["title"] is None
+
+    cid = blank.json()["id"]
+    named = admin_client.patch(f"/api/v1/commissions/{cid}", json={"title": "Named"})
+    assert named.status_code == 200, named.text
+    assert named.json()["title"] == "Named"
+
+    # omitting the field leaves the title untouched
+    untouched = admin_client.patch(f"/api/v1/commissions/{cid}", json={"rating": "mature"})
+    assert untouched.status_code == 200, untouched.text
+    assert untouched.json()["title"] == "Named"
+
+    # an explicit blank (or null) clears it again
+    cleared = admin_client.patch(f"/api/v1/commissions/{cid}", json={"title": ""})
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["title"] is None
+
+
 def test_create_adds_detached_node(admin_client: TestClient):
     data = _make_commission(admin_client)
     node_names = [n["name"] for n in data["nodes"]]
@@ -79,10 +104,9 @@ def test_update_commission(admin_client: TestClient):
 
 
 def test_copy_json_shape_has_no_credentials(admin_client: TestClient):
-    created = _make_commission(admin_client, completed_at="2024-09-12")
+    created = _make_commission(admin_client)
     payload = admin_client.get(f"/api/v1/commissions/{created['id']}/copy-json").json()
     assert payload["id"] == created["id"]
-    assert payload["date"] == "2024-09-12"  # alias is emitted, not 'completed_date'
     assert payload["files_endpoint"].endswith(f"/commissions/{created['id']}/files")
     assert "key" not in payload and "api_key" not in payload and "credentials" not in payload
 

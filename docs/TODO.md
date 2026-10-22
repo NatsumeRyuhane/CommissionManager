@@ -53,9 +53,13 @@
 - [x] Router + public-read / admin-edit gating
 - [x] Edit page: lifecycle stage management (add/rename/reorder/delete)
 - [x] Edit page: per-stage file upload/delete + set cover
+- [x] Edit page: per-file upload percentage previews + red failure state
+- [x] Lifecycle images: node-scoped viewer with keyboard/thumbnail navigation and
+  original/large/medium/small image downloads
+- [x] Edit page: Firefox-compatible drag-and-drop uploads + persisted file reorder within a stage
 - [x] Gallery: total count (X-Total-Count) + load-more pagination
 - [x] Focal-point reticle editor on uploaded images (Phase 2)
-- [ ] Mobile layouts (Phase 2)
+- [x] Mobile layouts (Phase 2)
 
 ### Deploy
 - [x] `deploy/docker-compose.dev.yml` (Postgres for local dev)
@@ -101,15 +105,183 @@
   - Public viewers see only commissions whose effective visibility is public; admins see
     everything in the picker (defaulting to commissions tagged with the character).
   - Still to do: drag-to-reorder of sets and tiles from the UI (backend endpoints exist),
-    typeahead/picker `has_page` marker, mobile character page polish.
+    typeahead/picker `has_page` marker.
 - [x] Artist management: multi-platform handles, paste-to-match, no-match resolve dialog
-- [ ] Mobile views for every section
+- [x] Mobile views for every section: responsive gallery columns, wrapping topbar,
+  bottom-sheet filter popover, horizontal settings tabs, stacked rails/grids, clamped
+  modals, iOS-safe field sizing, coarse-pointer touch targets
+- [x] UI polish pass: uniform button heights (`<a>`/`<button>` parity), lucide icons in
+  place of emoji glyphs, entrance/hover/focus motion with `prefers-reduced-motion` support
 - [x] Focal-point reticle editor on cover image
+  - Focal edits now stage in the edit form and commit with Save (failed saves keep the
+    staged values); editor actions are Center focal / Revert; `focal_zoom` (1.0–3.0)
+    crops toward the focal point everywhere covers render
 - [x] Export: DB export + file-export `.zip` (`{artists}-{id}/{node}/`, node-dated dirs)
+- [x] Image derivatives: in-app surfaces load server-generated variants instead of original
+  bytes (issue #19)
+  - `/api/v1/files/{id}/image?size=thumb|small|medium|large[&format=webp|jpeg|png]` behind
+    the same visibility gate as `/raw`; derivatives cache through the storage abstraction
+    under `derivatives/{storage_object_id}/` (pure cache, no schema change)
+  - Eager generation at upload (background task) + async build on cache miss: the endpoint
+    answers 202 and the frontend `DerivedImg` shows a placeholder and retries with backoff
+  - `FileOut`/`CoverOut` expose an `image_urls` preset map; `url` still points at `/raw`
+  - Surfaces: gallery/lifecycle/bookshelf/picker/visibility tiles `thumb`, focal editor
+    canvas + previews `small` (picking is percentage-based, so no precision loss), hero +
+    character main ref `medium` (+`srcset`), viewer defaults `medium` and downloads
+    server-rendered variants (client canvas resize removed); only downloads still
+    touch `/raw`
+  - Deleting a file/commission removes its derivatives; commission delete also stops
+    leaking original bytes + `storage_objects` rows; export zip stays originals-only
+- [x] CDN-backed file delivery (issue #20, Option 2 — object storage + CDN)
+  - `S3Storage` driver (S3-compatible: Cloudflare R2 / AWS S3 / MinIO) behind the existing
+    storage abstraction; selected via `CMGR_STORAGE_BACKEND=s3` + `CMGR_STORAGE_S3_*` /
+    `CMGR_STORAGE_CDN_BASE_URL` settings (boto3, lazily imported)
+  - `/files/{id}/raw` and `/files/{id}/image` now 302 to the CDN (public files) or a
+    signed URL (private files) when the backend provides URLs; `?redirect=0` opts back
+    into streaming (used by the viewer's blob downloads — fetch() can't carry credentials
+    across a cross-origin redirect)
+  - Streaming path got the Option-1 header work: `ETag` (checksum) + `If-None-Match` →
+    304, `Last-Modified`, `Cache-Control: public, max-age=86400` for public files,
+    `private, no-store` for admin-only files
+  - Upload keys + derivative cache keys carry an unguessable random/checksum segment:
+    safe behind a public bucket domain, busts caches on re-upload, and fixes the
+    duplicate-filename unique-constraint collision
+  - `python3 main.py storage <status|migrate> [--dry-run]` wraps
+    `python -m app.storage.migrate`: copies objects (and cached derivatives) into the
+    configured backend, verifies checksums, re-keys legacy predictable keys, commits
+    per object (resumable); source bytes are never deleted
+  - Settings → Storage panel now shows bucket / endpoint / CDN base URL
+  - CI: dedicated `S3 integration (live driver tests)` job runs the driver-contract tests
+    against a real bucket when the `TEST_S3_*` repo secrets/variables are set (gated on the
+    `TEST_S3_BUCKET` variable, skipped otherwise); the Backend job stays hermetic on the
+    fake S3 client
 - [ ] Webhooks delivery (`commission.created/updated/delivered`)
+- [x] UX streamline pass (creation friction, viewer, detail layout)
+  - Site-level stage template: `app_settings.default_stage_names` (comma-separated, display
+    order, first = topmost), editable under Settings → Site; `POST /commissions` applies it
+    when `node_names` is omitted (explicit `[]` still opts out)
+  - "+ New" creates an Untitled commission from the template and lands directly on the edit
+    page; the separate create form and `/commissions/new` route are gone (EditPage is
+    edit-only)
+  - Dropped `current_stage` everywhere (API list/detail, copy-json, chips, crumb, rail block):
+    the topmost stage conveys progress — **breaking API change**
+  - Image viewer reworked Preview-style: floats over the page on a translucent backdrop,
+    controls on top, thumbnail pill at the bottom, click the dark area to dismiss,
+    wheel/trackpad + touch pinch zoom with pan and double-click zoom; resolution choice
+    persists in localStorage and re-applies across image switches (clamped per file)
+  - Detail page: in-page cover removed (stage tiles open the viewer); lifecycle joined the
+    left column and the metadata rail is sticky on desktop
+  - Title nullable: omitted/blank/null titles store NULL (migration folds existing
+    "Untitled" rows into NULL); PATCH distinguishes omitted (unchanged) from explicit
+    null/blank (cleared) via `model_fields_set`. Gallery covers hide a null title;
+    detail/visibility pages and character-page tiles fall back to the commission number
+  - Gallery cover overlays: file type moved to a monospace badge pinned bottom-right
+    (lifecycle tiles share it; their text label shows image dimensions instead of the
+    format); rating chip replaced by tile border color (mature = yellow, adult = red,
+    general = neutral) with capitalized rating text in the filter popover and detail
+    page; phone-size viewports render covers with no overlays at all
+  - Original-download gate: `app_settings.allow_public_original_download` (Settings → Site
+    toggle, default on); when off, `/files/{id}/raw` and lossless `format=png` derivatives
+    require write access — visitors get lossy (jpeg/webp) derivatives only, the viewer hides
+    "Original" and saves jpeg for png sources. GIFs are exempt in all circumstances: re-encodes
+    can't preserve animation, so visible gifs are always served raw
+- [x] Public gallery gating + SFW mode
+  - Visitors only see commissions with ≥1 effectively-public file (no files, or only
+    private/detached ones → hidden from list and 404 on detail/images); admins see all,
+    with a semi-transparent white wash on effectively-private tiles as a hint
+  - Coverless tiles render a square no-image placeholder
+  - **Breaking:** `commission_metadata.completed_at` dropped (with its visibility field
+    plumbing) — the topmost stage is the most recent update, so the "date" sort,
+    date_from/date_to filters, and character-page recency derive from the topmost stage's
+    start date (fallback: created_at). Copy-JSON loses its `date` key
+  - SFW by default: a General/Mature/Adult content gate in the gallery top controls,
+    cumulative (Mature ⊇ General, Adult ⊇ all), persisted in localStorage; popover rating
+    filters are pruned/disabled above the gate
+  - Search & filter popover gains Tags, Characters, and Artists chip groups
+- [x] Live-togglable direct-to-S3 uploads (issue #26)
+  - `app_settings.allow_direct_upload` (Settings → Storage toggle, default off);
+    when on and the configured backend is `s3`, browsers `PUT` file bytes straight
+    to the bucket via a short-lived presigned URL (15-min TTL by default,
+    `CMGR_STORAGE_UPLOAD_URL_TTL`) instead of routing them through the app
+  - `POST /nodes/{id}/uploads` mints the session + presigned PUT;
+    `POST /uploads/{sid}/finalize` verifies the object via `HeadObject`, probes
+    image metadata, and creates the `storage_objects` + `commission_files` rows
+    transactionally (idempotent on retry);
+    `DELETE /uploads/{sid}` cancels and cleans up the orphan bytes;
+    `POST /uploads/cleanup` sweeps expired-unfinalized sessions (also runs
+    opportunistically on session create)
+  - Storage abstraction grew `presign_upload` + `head_object` —
+    `LocalStorage.presign_upload` returns `None` so the proxied path keeps
+    working; `S3Storage` signs Content-Type so the browser must declare it,
+    and Etag-driven verification fills in for a checksum during finalize
+  - `GET /settings/storage/capabilities` drives the frontend path choice;
+    the upload session toggle remains read per-request from the DB so a
+    multi-worker deployment observes flips without restarts. The
+    `CMGR_STORAGE_DIRECT_UPLOAD_ALLOWED` env kill switch blocks the toggle
+    from being enabled in deployments where bucket CORS isn't configured
+  - Frontend `StagesEditor` branches on capabilities: direct path is
+    presign → XHR PUT (progress) → finalize; failures during PUT cancel the
+    session instead of silently falling back to proxied uploads (bytes may
+    already be in S3 under the same key). New `processing` upload status
+    holds the tile at "Processing…" until finalize confirms registration
+  - Provider CORS configuration (Cloudflare R2 / AWS S3 / MinIO) is
+    documented in `docs/direct-upload-cors.md`
+  - Pending-upload tiles are first-class on the lifecycle grid:
+    cross-stage drag (deferred `moveFile` after the file lands),
+    click-to-retry on failure (resets the preview and re-runs the same
+    transport), and Save gated until every tile drains. Still locked out
+    of viewer, set-cover, and file-delete because `LifecycleUploadTile` is a
+    distinct component from `LifecycleFileTile`
+  - Agent-facing API: `GET /nodes/{id}/uploads` lists pending sessions
+    (admin-only, finalized rows excluded) and `GET /uploads/{sid}` returns
+    a single session with server-derived `is_expired` / `is_finalized` so
+    callers never parse timestamps. `delete_node` best-effort drops bytes
+    for the node's pending sessions before the FK cascade so the keys
+    never become permanent orphans
+- [x] Edit-page UX overhaul (companion to #26)
+  - Uploads no longer flip the shared `busy` flag — the rest of the editor
+    stays interactive (rename, reorder, more uploads) while bytes are in
+    flight; per-tile preview state communicates progress
+  - Admins clicking a commission card land directly on `/edit` (the edit
+    view is a strict superset of the read-only detail view); the catch-all
+    `/visibility` redirect preserves existing bookmarks
+  - **Breaking:** standalone `/commissions/{id}/visibility` page removed;
+    every visibility override is now an inline Public/Private/Inherit
+    toggle next to its component (commission, fields, stages, files). One
+    Save commits metadata + focal + visibility together
+- [x] Commission ongoing/completed status + "none" search filter
+  - `commission_metadata.status` enum (`ongoing` / `completed`): commission-
+    level lifecycle state, returned on list/detail, editable via create/update.
+    New commissions default to `ongoing`; the migration backfilled pre-existing
+    rows to `completed` (assumed delivered). No per-field visibility plumbing —
+    status is shown to everyone. Edit-rail picker + detail chip + a Status group
+    in the gallery search popover; `GET /commissions?status=` filters by membership
+  - Generic `__none__` sentinel on the categories/tags/characters/artists list
+    filters matches commissions with nothing set for that field; ORs with any
+    concrete values supplied alongside it. Surfaced as a `(none)` chip in each
+    of those popover groups (`crud.matches_multi_filter`)
+- [x] UX pass: persistent gallery filters + edit-page auto-save
+  - Gallery search/filter selections (query, category/tag/character/artist
+    chips, rating + status picks, sort/order) persist to `localStorage`
+    (`cmgr:gallery-filters`) so reopening the gallery restores the last view.
+    The rating gate keeps its own key and persisted rating picks above the
+    current ceiling are pruned on hydrate
+  - **Breaking (UX):** the edit page has no manual Save. Metadata, the staged
+    cover focal, and visibility edits are buffered and flushed 5 s after the
+    last change, applied to the backend one unit at a time. A passive status
+    indicator (Saved / Unsaved / Saving / failed) replaces the Save button;
+    "Done" flushes then returns to the read-only view. A unit that fails to
+    apply is shown as an out-of-sync warning and left on the page (continuing
+    to edit retries it); "Discard & refresh" reloads authoritative server state
+    and drops the buffered/out-of-sync edits. `beforeunload` and an unmount
+    flush guard against losing edits to a tab close or in-app navigation inside
+    the idle window. The stages editor keeps persisting its structural edits
+    immediately, independent of this buffer
 
 ## Phase 3 — Optional / advanced (deferred)
 - [ ] MCP server wrapping the REST API (tools: create_commission, upload_file, search, set_focal_point)
+- [ ] Advanced search syntax (`tag:x character:"y" -tag:z …`) — proposal in issue #29
+- [ ] Tag i18n: locale-bound translations alongside aliases, surfaced in autocomplete — issue #30
 - [ ] CLIP image2txt accessibility
 - [ ] PSD layer extraction for export
 - [ ] Physical / digital watermarking

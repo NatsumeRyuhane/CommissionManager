@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import images
 from app.models import (
     AppSettings,
     Artist,
@@ -20,10 +21,12 @@ from app.models import (
     Label,
     LabelAlias,
     LabelType,
+    UploadSession,
     Visibility,
     VisibilityPreset,
     VisibilityStageDefault,
 )
+from app.storage import StorageBackendDriver
 from app.schemas import (
     CommissionCreate,
     CommissionDetail,
@@ -45,6 +48,33 @@ from app.schemas import (
 
 SETTINGS_ID = 1
 DEFAULT_SITE_TITLE = "Commissions"
+# listed in display order: first name gets position 0 and renders topmost
+DEFAULT_STAGE_NAMES = "Delivered, Color, Lineart, Sketching"
+
+# Sentinel token a multi-select list filter may carry to match records that have
+# *nothing* set for that field (e.g. no categories). Kept namespaced enough that
+# it can't collide with a real label/character/artist name.
+NONE_SENTINEL = "__none__"
+
+
+def matches_multi_filter(selected: list[str], values: list[str]) -> bool:
+    """Whether `values` satisfies a multi-select filter `selected`.
+
+    An empty `selected` is no filter at all (everything matches). The
+    NONE_SENTINEL matches when `values` is empty ("not set"); any other token
+    matches by intersection. The two combine with OR, so selecting
+    `[NONE_SENTINEL, "Chibi"]` keeps records that have no value *or* "Chibi".
+    """
+    if not selected:
+        return True
+    if NONE_SENTINEL in selected and not values:
+        return True
+    concrete = [token for token in selected if token != NONE_SENTINEL]
+    return bool(set(concrete) & set(values))
+
+
+def split_stage_names(raw: str) -> list[str]:
+    return [name.strip() for name in raw.split(",") if name.strip()]
 
 FIELD_DEFAULTS: dict[str, bool] = {
     "title": True,
@@ -53,7 +83,6 @@ FIELD_DEFAULTS: dict[str, bool] = {
     "rating": True,
     "characters": True,
     "artists": True,
-    "completed_at": True,
     "confirmed_at": False,
     "price": False,
 }
@@ -265,8 +294,8 @@ def create_commission(db: Session, data: CommissionCreate) -> Commission:
         commission_id=commission.id,
         title=data.title,
         description=data.description,
-        completed_at=data.completed_at,
         rating=data.rating,
+        status=data.status,
         confirmed_at=data.confirmed_at,
         price_amount=data.price_amount,
         price_currency=data.price_currency,
@@ -282,7 +311,15 @@ def create_commission(db: Session, data: CommissionCreate) -> Commission:
             visibility_override=Visibility.private,
         )
     )
-    for i, node_name in enumerate(data.node_names):
+    # when the caller doesn't specify stages, apply the site default template
+    # (an explicitly empty list still creates a stage-less commission)
+    node_names = data.node_names
+    if "node_names" not in data.model_fields_set:
+        app_settings = db.get(AppSettings, SETTINGS_ID)
+        node_names = split_stage_names(
+            app_settings.default_stage_names if app_settings is not None else DEFAULT_STAGE_NAMES
+        )
+    for i, node_name in enumerate(node_names):
         commission.nodes.append(
             CommissionNode(
                 name=node_name,
@@ -304,11 +341,14 @@ def create_commission(db: Session, data: CommissionCreate) -> Commission:
 
 def update_commission(db: Session, commission: Commission, data: CommissionUpdate) -> Commission:
     meta = commission.meta
+    # title is nullable: an explicit null/blank clears it, so omission is
+    # detected via model_fields_set instead of a None sentinel
+    if "title" in data.model_fields_set:
+        meta.title = data.title
     for field in (
-        "title",
         "description",
-        "completed_at",
         "rating",
+        "status",
         "confirmed_at",
         "price_amount",
         "price_currency",
@@ -356,6 +396,13 @@ def _apply_labels(
 # ---------------------------------------------------------------- serialization
 def _file_url(file_id: int) -> str:
     return f"/api/v1/files/{file_id}/raw"
+
+
+def _image_urls(file_id: int) -> dict[str, str]:
+    """Preset name -> derivative URL, for image files only."""
+    return {
+        preset: f"/api/v1/files/{file_id}/image?size={preset}" for preset in images.PRESETS
+    }
 
 
 def default_stage_visibility(stage_name: str, context: VisibilityContext) -> Visibility:
@@ -412,8 +459,57 @@ def ensure_app_settings(db: Session) -> AppSettings:
 def site_settings_out(settings: AppSettings | None) -> SiteSettingsOut:
     return SiteSettingsOut(
         site_title=settings.site_title if settings is not None else DEFAULT_SITE_TITLE,
+        default_stage_names=split_stage_names(
+            settings.default_stage_names if settings is not None else DEFAULT_STAGE_NAMES
+        ),
+        allow_public_original_download=(
+            settings.allow_public_original_download if settings is not None else True
+        ),
+        allow_direct_upload=(
+            settings.allow_direct_upload if settings is not None else False
+        ),
         updated_at=settings.updated_at if settings is not None else None,
     )
+
+
+def public_originals_allowed(db: Session) -> bool:
+    settings = db.get(AppSettings, SETTINGS_ID)
+    return settings.allow_public_original_download if settings is not None else True
+
+
+def direct_upload_enabled(db: Session) -> bool:
+    """Per-request DB read so toggle changes are observed across workers without
+    invalidating any process-local cache."""
+    settings = db.get(AppSettings, SETTINGS_ID)
+    return settings.allow_direct_upload if settings is not None else False
+
+
+def cleanup_expired_upload_sessions(
+    db: Session, storage: StorageBackendDriver
+) -> int:
+    """Delete unfinalized upload sessions past their TTL, removing any orphaned
+    bytes that may have been uploaded but never registered as commission files.
+    Finalized sessions are kept as an audit trail."""
+    now = datetime.now(timezone.utc)
+    expired = list(
+        db.scalars(
+            select(UploadSession).where(
+                UploadSession.finalized_at.is_(None),
+                UploadSession.expires_at < now,
+            )
+        )
+    )
+    for session in expired:
+        try:
+            storage.delete(session.storage_key, bucket=session.storage_bucket)
+        except (OSError, Exception):  # noqa: BLE001 — best-effort cleanup
+            # If the provider call fails we still drop the session row; the
+            # operator can run cleanup again later, and a real S3 outage will
+            # surface on the next call anyway.
+            pass
+        db.delete(session)
+    db.commit()
+    return len(expired)
 
 
 def ensure_visibility_settings(db: Session) -> tuple[AppSettings, list[VisibilityStageDefault]]:
@@ -489,6 +585,16 @@ def effective_file_visibility(file, context: VisibilityContext) -> Visibility:
     return effective_node_visibility(file.node, context)
 
 
+def has_public_file(commission: Commission, context: VisibilityContext) -> bool:
+    """Whether any file is effectively public. Visitors never see commissions
+    without one: nothing would render, so they are hidden outright."""
+    return any(
+        effective_file_visibility(file, context) == Visibility.public
+        for node in commission.nodes
+        for file in node.files
+    )
+
+
 def _effective_field_public(
     commission: Commission, field: str, context: VisibilityContext
 ) -> bool:
@@ -533,31 +639,14 @@ def ordered_nodes(commission: Commission) -> list[CommissionNode]:
     return regular
 
 
-def _current_stage(
-    commission: Commission,
-    visibility_context: VisibilityContext | None = None,
-    include_private: bool = True,
-) -> str | None:
+def commission_date(commission: Commission) -> date | None:
+    """The commission's date for sorting/filtering: the topmost stage is the
+    most recent update, so its start date stands in; stage-less commissions
+    fall back to their creation date."""
     nodes = ordered_nodes(commission)
-    if not include_private and visibility_context is not None:
-        nodes = [
-            node
-            for node in nodes
-            if effective_node_visibility(node, visibility_context) == Visibility.public
-        ]
-    with_files = [
-        node
-        for node in nodes
-        if any(
-            include_private
-            or visibility_context is None
-            or effective_file_visibility(file, visibility_context) == Visibility.public
-            for file in node.files
-        )
-    ]
-    if with_files:
-        return with_files[-1].name
-    return nodes[-1].name if nodes else None
+    if nodes and nodes[0].started_at:
+        return nodes[0].started_at.date()
+    return commission.created_at.date() if commission.created_at else None
 
 
 def _cover(
@@ -594,10 +683,12 @@ def _cover(
     return CoverOut(
         file_id=cover_file.id,
         url=_file_url(cover_file.id),
+        image_urls=_image_urls(cover_file.id),
         width=cover_file.width,
         height=cover_file.height,
         focal_x=cover_file.focal_x,
         focal_y=cover_file.focal_y,
+        focal_zoom=cover_file.focal_zoom,
     )
 
 
@@ -635,12 +726,9 @@ def serialize_list_item(
             if meta and (include_private or _effective_field_public(commission, "rating", visibility_context))
             else None
         ),
-        completed_at=(
-            meta.completed_at
-            if meta
-            and (include_private or _effective_field_public(commission, "completed_at", visibility_context))
-            else None
-        ),
+        # status has no per-field visibility plumbing — it's benign lifecycle
+        # info shown to everyone, so it isn't gated like rating/title/etc.
+        status=meta.status if meta else None,
         visibility=meta.visibility_override if meta else None,
         effective_visibility=effective_commission_visibility(commission, visibility_context),
         categories=categories_of(commission) if labels_public else [],
@@ -656,7 +744,6 @@ def serialize_list_item(
             else []
         ),
         formats=formats_of(commission, visibility_context, include_private),
-        current_stage=_current_stage(commission, visibility_context, include_private),
         cover=_cover(commission, visibility_context, include_private),
     )
 
@@ -667,6 +754,7 @@ def file_out(
     return FileOut(
         id=f.id,
         node_id=f.node_id,
+        position=f.position,
         format=f.format,
         label=f.label,
         is_image=f.is_image,
@@ -674,6 +762,7 @@ def file_out(
         height=f.height,
         focal_x=f.focal_x,
         focal_y=f.focal_y,
+        focal_zoom=f.focal_zoom,
         visibility=f.visibility_override,
         effective_visibility=(
             effective_file_visibility(f, visibility_context)
@@ -681,6 +770,7 @@ def file_out(
             else None
         ),
         url=_file_url(f.id),
+        image_urls=_image_urls(f.id) if f.is_image else None,
         is_cover=(f.id == cover_file_id),
     )
 
@@ -691,7 +781,7 @@ def node_out(
     visibility_context: VisibilityContext | None = None,
     include_private: bool = True,
 ) -> NodeOut:
-    files = node.files
+    files = sorted(node.files, key=lambda file: (file.position, file.id))
     if not include_private and visibility_context is not None:
         files = [
             file
@@ -823,15 +913,13 @@ def serialize_copy_json(commission: Commission) -> CopyJsonOut:
     cats = categories_of(commission)
     return CopyJsonOut(
         id=commission.id,
-        title=meta.title if meta else f"#{commission.id}",
-        completed_date=meta.completed_at if meta else None,
+        title=(meta.title if meta else None) or f"#{commission.id}",
         confirmed_at=meta.confirmed_at if meta else None,
         category=cats[0] if cats else None,
         rating=meta.rating if meta else None,
         tags=tags_of(commission),
         characters=[c.name for c in commission.characters],
         artists=[a.name for a in commission.artists],
-        current_stage=_current_stage(commission),
         files_endpoint=f"/api/v1/commissions/{commission.id}/files",
         public_images_endpoint=f"/api/v1/commissions/{commission.id}/images?visibility=public",
     )
