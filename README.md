@@ -234,6 +234,21 @@ updating the repo secret and `deploy/.env`, then restarting the stack.
 - `GET /api/v1/commissions/{id}/copy-json` returns an agent-friendly payload (internal id, key
   metadata, and endpoint URLs) — **never credentials**.
 - Machine access uses scoped API keys (`read` / `write`) via `Authorization: Bearer cmgr_…`.
+- Agents can monitor a file upload by generating a unique UUID, sending it as `X-Upload-ID` on
+  `POST /api/v1/nodes/{node_id}/files`, and polling `GET /api/v1/uploads/{upload_id}/progress`
+  with the same write credentials. The progress response reports server-received multipart request bytes,
+  percentage when `Content-Length` is known, and `receiving`, `processing`, `completed`, or
+  `failed` status. The upload and polling requests must run concurrently:
+  ```sh
+  UPLOAD_ID="$(uuidgen)"
+  curl -X POST "https://commission.example/api/v1/nodes/42/files" \
+    -H "Authorization: Bearer $CMGR_API_KEY" -H "X-Upload-ID: $UPLOAD_ID" \
+    -F "upload=@final.png" &
+  curl -H "Authorization: Bearer $CMGR_API_KEY" \
+    "https://commission.example/api/v1/uploads/$UPLOAD_ID/progress"
+  ```
+  Records are retained for about one hour and are process-local; clients should still retain the
+  final upload response as the source of truth.
 
 See [docs/TODO.md](docs/TODO.md) for the roadmap/status and
 [docs/architecture.md](docs/architecture.md) for design notes.

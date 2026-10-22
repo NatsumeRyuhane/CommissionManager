@@ -5,13 +5,15 @@ import mimetypes
 import random
 from datetime import datetime, timezone
 from email.utils import format_datetime
-from uuid import uuid4
+from typing import Annotated
+from uuid import UUID, uuid4
 
 from fastapi import (
     APIRouter,
     BackgroundTasks,
     Depends,
     Form,
+    Header,
     HTTPException,
     Query,
     Request,
@@ -41,11 +43,13 @@ from app.schemas import (
     FileMove,
     FileOut,
     FileReorder,
+    UploadProgressOut,
     UploadSessionCreate,
     UploadSessionOut,
     UploadSessionStatusOut,
 )
 from app.storage import get_storage
+from app.upload_progress import upload_progress
 
 router = APIRouter(tags=["files"])
 
@@ -91,6 +95,7 @@ async def upload_file(
     upload: UploadFile,
     background: BackgroundTasks,
     label: str | None = Form(default=None),
+    upload_id: Annotated[UUID | None, Header(alias="X-Upload-ID")] = None,
     db: Session = Depends(get_db),
     _: Principal = Depends(require_edit),
 ):
@@ -153,6 +158,24 @@ async def upload_file(
             images.generate_presets, obj.id, stored.checksum, stored.key, stored.bucket
         )
     return crud.file_out(file, None, crud.load_visibility_context(db))
+
+
+@router.get("/uploads/{upload_id}/progress", response_model=UploadProgressOut)
+def get_upload_progress(
+    upload_id: UUID,
+    _: Principal = Depends(require_edit),
+):
+    progress = upload_progress.get(str(upload_id))
+    if progress is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload progress not found")
+    return UploadProgressOut(
+        upload_id=progress.upload_id,
+        status=progress.status,
+        received_bytes=progress.received_bytes,
+        total_bytes=progress.total_bytes,
+        percentage=progress.percentage,
+        detail=progress.detail,
+    )
 
 
 # ---------------------------------------------------------------- direct uploads
