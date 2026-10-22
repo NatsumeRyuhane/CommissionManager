@@ -230,12 +230,27 @@ a { color: inherit; text-decoration: none; }
   display: block;
   transform: scale(var(--focal-zoom, 1));
 }
+/* An image that hasn't painted yet: no animation, just the hatch .imgph already
+   paints plus a label saying so. A waterfall of tiles all pulsing at once reads
+   as noise, and the word survives being glanced at.
+   Uses ::before because .fa-tile.is-private claims ::after for its wash, and
+   z-index lifts it over the (transformed, so stacking-context-forming) <img>. */
+.imgph.is-loading::before {
+  content: "LOADING";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  letter-spacing: 0.14em;
+}
 
 /* ---- skeleton / shimmer placeholders ----
    A soft band sweeping across the paper tint. The global reduced-motion rule
    (top of file) freezes the sweep; the static tint still reads as a placeholder.
-   Reused both as a standalone <Skeleton> block and, on .imgph, as the backdrop
-   shown until a cover image finishes loading. */
+   Used for text-shaped <Skeleton> blocks; image surfaces use .imgph.is-loading
+   above instead. */
 @keyframes skeleton-shimmer {
   from { background-position: 150% 0; }
   to { background-position: -150% 0; }
