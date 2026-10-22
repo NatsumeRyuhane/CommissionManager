@@ -43,7 +43,9 @@ class UploadProgressRegistry:
     def start(self, upload_id: str, total_bytes: int | None) -> None:
         with self._lock:
             self._prune()
-            self._make_room()
+            # restarting a known upload ID reuses its slot; only new IDs need room
+            if upload_id not in self._entries:
+                self._make_room()
             self._set(
                 UploadProgress(
                     upload_id=upload_id,

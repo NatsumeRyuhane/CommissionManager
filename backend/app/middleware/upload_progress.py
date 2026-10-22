@@ -64,7 +64,12 @@ class UploadProgressMiddleware:
             raise
         else:
             succeeded = response_status is not None and 200 <= response_status < 300
-            detail = None if succeeded else f"Upload failed with HTTP status {response_status}"
+            if succeeded:
+                detail = None
+            elif response_status is None:
+                detail = "Upload failed: no HTTP response sent"
+            else:
+                detail = f"Upload failed with HTTP status {response_status}"
             upload_progress.finish(upload_id, succeeded=succeeded, detail=detail)
 
     @staticmethod

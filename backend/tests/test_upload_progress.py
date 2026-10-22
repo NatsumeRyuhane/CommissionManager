@@ -63,3 +63,44 @@ def test_upload_progress_registry_discards_oldest_entry_at_capacity(monkeypatch)
     assert registry.get(upload_ids[0]) is None
     assert registry.get(upload_ids[1]) is not None
     assert registry.get(upload_ids[2]) is not None
+
+
+def test_upload_progress_registry_restart_at_capacity_keeps_other_entries(monkeypatch):
+    monkeypatch.setattr("app.upload_progress.MAX_PROGRESS_ENTRIES", 2)
+    registry = UploadProgressRegistry()
+    upload_ids = [str(uuid4()) for _ in range(2)]
+
+    for upload_id in upload_ids:
+        registry.start(upload_id, 100)
+    registry.start(upload_ids[1], 200)
+
+    assert registry.get(upload_ids[0]) is not None
+    assert registry.get(upload_ids[1]).total_bytes == 200
+
+
+def test_upload_progress_reports_missing_response_start():
+    upload_id = str(uuid4())
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message):
+        return None
+
+    async def downstream(_scope, receive, _send):
+        await receive()
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/v1/nodes/1/files",
+        "headers": [(b"x-upload-id", upload_id.encode())],
+    }
+
+    upload_progress.clear()
+    asyncio.run(UploadProgressMiddleware(downstream)(scope, receive, send))
+
+    progress = upload_progress.get(upload_id)
+    assert progress.status == "failed"
+    assert progress.detail == "Upload failed: no HTTP response sent"
+    upload_progress.clear()
